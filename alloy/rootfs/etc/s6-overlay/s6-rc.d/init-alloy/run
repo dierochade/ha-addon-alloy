@@ -46,6 +46,20 @@ HOST_LABEL=$(opt '.host_label // ""')
 STREAM_LABELS=$(opt '(.stream_labels // ["hostname","unit","level"]) | join(" ")')
 STRUCTURED_METADATA=$(opt '.structured_metadata // false')
 LEVEL_FROM_MESSAGE=$(opt '.level_from_message // false')
+STRIP_ANSI=$(opt '.strip_ansi // false')
+# multiline_containers: a regex of container names whose Python tracebacks are
+# joined into one entry. Empty = off. It lands inside a LogQL selector inside an
+# Alloy string, so only regex characters are accepted: no quotes, backslashes,
+# braces or spaces, and nothing has to be escaped twice.
+MULTILINE_CONTAINERS=$(opt '.multiline_containers // ""')
+if [ -n "${MULTILINE_CONTAINERS}" ]; then
+    # shellcheck disable=SC2016 # a literal regex: $ is an anchor, not an expansion
+    ml_re='^[][A-Za-z0-9_.|*+?^$()-]+$'
+    if ! [[ "${MULTILINE_CONTAINERS}" =~ ${ml_re} ]]; then
+        echo "!! multiline_containers may only hold a regex of container names (letters, digits, _ . - and | * + ? ^ \$ ( ) [ ]), not '${MULTILINE_CONTAINERS}'"
+        exit 1
+    fi
+fi
 METRICS_ENABLED=$(opt '.metrics_enabled // false')
 ADDITIONAL_CONFIG=$(opt '.additional_config // ""')
 
@@ -202,6 +216,7 @@ echo " Log level: ${LOG_LEVEL}"
 echo " job: ${JOB}   stream labels: ${STREAM_LABELS}"
 [ -n "${HOST_LABEL}" ] && echo " host label: ${HOST_LABEL} (replaces hostname)"
 echo " structured metadata: ${STRUCTURED_METADATA}   level from message: ${LEVEL_FROM_MESSAGE}"
+echo " strip ANSI colours: ${STRIP_ANSI}   multiline containers: ${MULTILINE_CONTAINERS:-off}"
 echo "-----------------------------------------------------------"
 
 # ── Source and stream labels ────────────────────────────────────────────────
@@ -242,10 +257,15 @@ has_label syslog_identifier && relabel __journal_syslog_identifier syslog_identi
 has_label container_name    && relabel __journal_container_name   container_name
 has_label transport         && relabel __journal__transport       transport
 has_label priority          && relabel __journal_priority         priority
-# level_from_message needs to know which streams are containers, whether or not
-# container_name was chosen as a label; a temporary label is dropped again below.
+# level_from_message and multiline_containers need to know which streams are
+# containers, whether or not container_name was chosen as a label; temporary
+# labels are dropped again below.
+NEED_CONTAINER=false
+{ [ "${LEVEL_FROM_MESSAGE}" = "true" ] || [ -n "${MULTILINE_CONTAINERS}" ]; } && NEED_CONTAINER=true
 if [ "${LEVEL_FROM_MESSAGE}" = "true" ]; then
     has_label level          || relabel __journal_priority_keyword level
+fi
+if [ "${NEED_CONTAINER}" = "true" ]; then
     has_label container_name || relabel __journal_container_name   container_name
 fi
 echo "}" >> "${CONFIG_FILE}"
@@ -260,9 +280,11 @@ printf '\nloki.process "journal" {\n  stage.static_labels {\n    values = {\n   
 
 if [ "${USE_JSON}" = "true" ]; then
 cat >> "${CONFIG_FILE}" <<'EOF'
-  // Pull the fields structured_metadata carries out of the JSON entry. The
-  // line is the JSON until stage.output restores the MESSAGE at the end, so
-  // every stage in between that reads content must say source = "message".
+  // Pull the fields structured_metadata carries out of the JSON entry, then
+  // make the line the journal MESSAGE again straight away. The fields stay in
+  // the extracted map for structured_metadata; every stage that reads text
+  // (strip_ansi, multiline, level_from_message) reads the plain MESSAGE, as on
+  // the non-JSON path. stage.multiline has no source and must see the MESSAGE.
   stage.json {
     expressions = {
       message           = "MESSAGE",
@@ -270,6 +292,47 @@ cat >> "${CONFIG_FILE}" <<'EOF'
       container_name    = "CONTAINER_NAME",
       transport         = "_TRANSPORT",
       priority          = "PRIORITY",
+    }
+  }
+  stage.output {
+    source = "message"
+  }
+EOF
+fi
+
+# strip_ansi runs before everything that reads the text (level_from_message),
+# so a colour code can never sit between a timestamp and its level token.
+if [ "${STRIP_ANSI}" = "true" ]; then
+cat >> "${CONFIG_FILE}" <<EOF
+
+  // strip_ansi: terminal colour codes (ESC [ ... letter) out of the line, as
+  // Home Assistant, the Supervisor and Zigbee2MQTT write them.
+  stage.replace {
+    expression = "(\\\\x1b\\\\[[0-9;?]*[A-Za-z])"
+    replace    = ""
+  }
+EOF
+fi
+
+# multiline_containers runs after strip_ansi (its firstline still accepts a
+# leading colour code, for strip_ansi off) and BEFORE level_from_message: a
+# header and its traceback lines share one stream only while every line still
+# carries the journal's level; once the level is re-derived per line they would
+# split into different streams and never be joined.
+if [ -n "${MULTILINE_CONTAINERS}" ]; then
+cat >> "${CONFIG_FILE}" <<EOF
+
+  // multiline_containers: Docker's journald driver writes every line of a
+  // Python traceback as an entry of its own. For these containers a line that
+  // does not start a record (a timestamp, or Python's "--- Logging error ---")
+  // is appended to the record before it, per stream, for up to 3 s.
+  stage.match {
+    selector = "{container_name=~\\"${MULTILINE_CONTAINERS}\\"}"
+
+    stage.multiline {
+      firstline     = "^(?:\\\\x1b\\\\[[0-9;]*m)?(?:\\\\d{4}-\\\\d{2}-\\\\d{2}[ T]\\\\d{2}:\\\\d{2}:\\\\d{2}|--- Logging error ---)"
+      max_wait_time = "3s"
+      max_lines     = 128
     }
   }
 EOF
@@ -281,33 +344,37 @@ fi
 # tell container streams apart. Found by the gate: with the order reversed the
 # level was never corrected on the metadata path.
 if [ "${LEVEL_FROM_MESSAGE}" = "true" ]; then
-    # With the JSON path on, the line is the whole journal entry until the end
-    # of the pipeline; the level must be read from the MESSAGE field, or a
-    # level token in any other field (a command line, a tag) would be taken.
-    LEVEL_SOURCE=""
-    [ "${USE_JSON}" = "true" ] && LEVEL_SOURCE='      source     = "message"'
+    # The line is the journal MESSAGE on both paths (stage.output runs right
+    # after stage.json), so a level token in any other field (a command line,
+    # a tag) is never seen.
 cat >> "${CONFIG_FILE}" <<EOF
 
   // Docker's journald driver logs a container's stderr at priority err, so a
   // WARN or INFO line written to stderr arrives as level="error". Scoped to
   // container streams at that priority; the level is re-derived from the
-  // message (logfmt level=..., or a bare LEVEL token) and falls back to "error".
+  // message (logfmt level=..., a bare LEVEL token, or a lowercase level as the
+  // line's first word, "info: ..." / "s6-rc: info: ..." / "[warn] ...") and
+  // falls back to "error".
   stage.match {
     selector = "{level=\\"error\\", container_name=~\\".+\\"}"
 
     stage.regex {
-${LEVEL_SOURCE}
       expression = "(?:^|\\\\s)level=(?P<logfmt_level>trace|debug|info|warn|warning|error|fatal|critical)(?:\\\\s|$)"
     }
     stage.regex {
-${LEVEL_SOURCE}
       expression = "(?:^|\\\\s)(?P<bare_level>TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL|CRITICAL)(?:\\\\s|:)"
+    }
+    // Lowercase only where it can only be a level: first word of the line,
+    // optionally behind one "program: " prefix (s6-overlay, bashio), as
+    // "level:" or "[level]". "disk info: low" stays untouched.
+    stage.regex {
+      expression = "^(?:[\\\\w./-]+: )?\\\\[?(?P<prefix_level>trace|debug|info|notice|warn|warning|error|fatal|critical)(?:\\\\]|:)(?:\\\\s|$)"
     }
 EOF
 cat >> "${CONFIG_FILE}" <<'EOF'
     stage.template {
       source   = "derived_level"
-      template = "{{ if .logfmt_level }}{{ if eq .logfmt_level \"warn\" }}warning{{ else if eq .logfmt_level \"critical\" }}crit{{ else }}{{ .logfmt_level }}{{ end }}{{ else if .bare_level }}{{ if eq .bare_level \"TRACE\" }}trace{{ else if eq .bare_level \"DEBUG\" }}debug{{ else if eq .bare_level \"INFO\" }}info{{ else if eq .bare_level \"WARN\" }}warning{{ else if eq .bare_level \"WARNING\" }}warning{{ else if eq .bare_level \"ERROR\" }}error{{ else if eq .bare_level \"FATAL\" }}fatal{{ else if eq .bare_level \"CRITICAL\" }}crit{{ else }}error{{ end }}{{ else }}error{{ end }}"
+      template = "{{ if .logfmt_level }}{{ if eq .logfmt_level \"warn\" }}warning{{ else if eq .logfmt_level \"critical\" }}crit{{ else }}{{ .logfmt_level }}{{ end }}{{ else if .bare_level }}{{ if eq .bare_level \"TRACE\" }}trace{{ else if eq .bare_level \"DEBUG\" }}debug{{ else if eq .bare_level \"INFO\" }}info{{ else if eq .bare_level \"WARN\" }}warning{{ else if eq .bare_level \"WARNING\" }}warning{{ else if eq .bare_level \"ERROR\" }}error{{ else if eq .bare_level \"FATAL\" }}fatal{{ else if eq .bare_level \"CRITICAL\" }}crit{{ else }}error{{ end }}{{ else if .prefix_level }}{{ if eq .prefix_level \"warn\" }}warning{{ else if eq .prefix_level \"critical\" }}crit{{ else }}{{ .prefix_level }}{{ end }}{{ else }}error{{ end }}"
     }
     stage.labels {
       values = {
@@ -316,12 +383,19 @@ cat >> "${CONFIG_FILE}" <<'EOF'
     }
   }
 EOF
-    drop=""
+fi
+
+# Temporary labels level_from_message and multiline_containers needed, dropped
+# before structured_metadata (which would move container_name otherwise).
+drop=""
+if [ "${NEED_CONTAINER}" = "true" ]; then
     has_label container_name || drop="${drop}\"container_name\", "
+fi
+if [ "${LEVEL_FROM_MESSAGE}" = "true" ]; then
     has_label level          || drop="${drop}\"level\", "
-    if [ -n "${drop}" ]; then
-        printf '\n  // Temporary labels level_from_message needed, not chosen in stream_labels.\n  stage.label_drop {\n    values = [%s]\n  }\n' "${drop%, }" >> "${CONFIG_FILE}"
-    fi
+fi
+if [ -n "${drop}" ]; then
+    printf '\n  // Temporary labels, not chosen in stream_labels.\n  stage.label_drop {\n    values = [%s]\n  }\n' "${drop%, }" >> "${CONFIG_FILE}"
 fi
 
 if [ "${STRUCTURED_METADATA}" = "true" ]; then
@@ -338,15 +412,6 @@ if [ "${STRUCTURED_METADATA}" = "true" ]; then
     fi
 fi
 
-if [ "${USE_JSON}" = "true" ]; then
-cat >> "${CONFIG_FILE}" <<'EOF'
-
-  // The line itself is the journal MESSAGE again, not the JSON entry.
-  stage.output {
-    source = "message"
-  }
-EOF
-fi
 cat >> "${CONFIG_FILE}" <<EOF
   stage.drop {
     expression = "^\\\\s*$"

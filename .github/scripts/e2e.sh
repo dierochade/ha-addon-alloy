@@ -19,6 +19,10 @@
 #   8. a localhost loki_url and contradictory credentials are refused with a
 #      reason; a job with quotes and backslashes ships as that exact label
 #   9. host_label: the line carries a static host label and no hostname
+#  10. strip_ansi: colour codes are gone from the stored line, and the level
+#      token behind one is still found
+#  11. multiline_containers: a Python traceback written line by line arrives as
+#      one entry with the header's level, on the JSON and the plain path
 #   4. the kernel logged ZERO apparmor DENIED (or ALLOWED) events for the
 #      profile - last, so it covers every run above
 #
@@ -200,7 +204,9 @@ PY
           --data-urlencode "end=$(( $(date +%s) + 60 ))000000000" --data-urlencode "limit=5")
     case "$q" in *"$text"*)
       hit=$(printf '%s' "$q" | python3 -c 'import json,sys; r=json.load(sys.stdin)["data"]["result"]; print(json.dumps([{"labels": x["stream"], "line": x["values"][0][1][:80]} for x in r]))')
-      got=$(printf '%s' "$q" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["result"][0]["stream"].get("level",""))'); break ;;
+      got=$(printf '%s' "$q" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["result"][0]["stream"].get("level",""))')
+      # The stored line itself, for steps that check what the pipeline did to the text.
+      LEVEL_LINE=$(printf '%s' "$q" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["result"][0]["values"][0][1])'); break ;;
     esac
   done
   [ "$got" = "$want" ] || fail "level for message '$msg' ($*) is '$got', expected '$want'; matched: $hit"
@@ -355,6 +361,9 @@ if [ -z "$LOCAL" ]; then
   probe_level warning "level=warn container said so"
   probe_level error   "a plain line with no level token" "CONTAINER_TAG=level=info"
   probe_level info    "INFO: bare token form"
+  probe_level info    "s6-rc: info: service e2e successfully started"
+  probe_level warning "[warn] bracketed lowercase"
+  probe_level error   "disk info: not a level token"
 fi
 
 say "3b. level_from_message on the plain (non-JSON) path"
@@ -364,6 +373,9 @@ if [ -z "$LOCAL" ]; then
   probe_level warning "level=warn container said so"
   probe_level error   "a plain line with no level token" "CONTAINER_TAG=level=info"
   probe_level info    "INFO: bare token form"
+  probe_level info    "s6-rc: info: service e2e successfully started"
+  probe_level warning "[warn] bracketed lowercase"
+  probe_level error   "disk info: not a level token"
   CUR_JOB="systemd-journal"
 else
   echo "skipped (E2E_LOCAL: needs the host journal)"
@@ -491,6 +503,72 @@ if [ -z "$LOCAL" ]; then
   printf '%s' "$STREAM" | python3 -c 'import json,sys; l=json.load(sys.stdin)["labels"]; sys.exit(0 if l.get("host")=="e2e-haos" else 1)' \
     || fail "host label wrong: $STREAM"
   echo "host label set, hostname gone"
+fi
+
+say "10. strip_ansi: colour codes removed before the level is read"
+if [ -z "$LOCAL" ]; then
+  # JSON path (structured_metadata), the one where the text is an extracted
+  # field rather than the line: the harder case for a replace stage.
+  start_addon "{\"loki_url\":\"$LOKI_PUSH\",\"job\":\"e2e-ansi\",\"structured_metadata\":true,\"level_from_message\":true,\"strip_ansi\":true}"
+  CUR_JOB="e2e-ansi"
+  # ESC[1;33m directly before the token: without the strip, "mWARNING" is no
+  # bare token and the line would fall back to error.
+  probe_level warning $'\e[1;33mWARNING\e[0m coloured token'
+  case "$LEVEL_LINE" in *$'\e'*) fail "colour code left in the stored line: $(printf '%q' "$LEVEL_LINE")" ;; esac
+  case "$LEVEL_LINE" in "WARNING coloured token "*) : ;; *) fail "stored line is not the stripped text: $(printf '%q' "$LEVEL_LINE")" ;; esac
+  echo "colour codes stripped, level read behind them"
+  CUR_JOB="systemd-journal"
+else
+  echo "skipped (E2E_LOCAL: needs the host journal)"
+fi
+
+say "11. multiline_containers: a traceback becomes one entry"
+if [ -z "$LOCAL" ]; then
+  for SM in true false; do
+    start_addon "{\"loki_url\":\"$LOKI_PUSH\",\"job\":\"e2e-multi\",\"structured_metadata\":$SM,\"level_from_message\":true,\"multiline_containers\":\"e2e-python\"}"
+    mt="ml-$RUN_ID-$RANDOM"
+    # Five entries as Docker's journald driver writes a Python traceback: a
+    # header, three continuation lines, the next record. Through a file, as
+    # in probe_level, so no command line carries the probe text.
+    {
+      printf '%s\n' "2026-01-01 00:00:00.000 WARNING (MainThread) [e2e] header $mt"
+      printf '%s\n' "Traceback (most recent call last):"
+      printf '%s\n' '  File "e2e.py", line 1, in <module>'
+      printf '%s\n' "ValueError: $mt-tail"
+      printf '%s\n' "2026-01-01 00:00:01.000 INFO (MainThread) [e2e] next $mt-next"
+    } > /tmp/ci-multi.txt
+    sudo python3 - /tmp/ci-multi.txt <<'PY'
+import sys
+from systemd import journal
+for line in open(sys.argv[1]).read().splitlines():
+    journal.send(line, CONTAINER_NAME="e2e-python", PRIORITY=3, SYSLOG_IDENTIFIER="ci-probe")
+PY
+    mq=""
+    for _ in $(seq 1 24); do
+      sleep 5
+      mq=$(curl -sG "$LOKI_QUERY/loki/api/v1/query_range" \
+            --data-urlencode "query={job=\"e2e-multi\"} |= \"$mt-tail\"" \
+            --data-urlencode "start=$(( $(date +%s) - 900 ))000000000" \
+            --data-urlencode "end=$(( $(date +%s) + 60 ))000000000" --data-urlencode "limit=10")
+      case "$mq" in *"$mt-tail"*) break ;; esac
+    done
+    # Exactly one entry holds the tail, it starts with the header, has four
+    # lines, and carries the header's level.
+    printf '%s' "$mq" | python3 -c '
+import json,sys
+mt=sys.argv[1]
+r=json.load(sys.stdin)["data"]["result"]
+vals=[(s["stream"],v[1]) for s in r for v in s["values"]]
+assert len(vals)==1, "expected one entry holding the tail, got %d: %r" % (len(vals), vals)
+labels,line=vals[0]
+lines=line.split("\n")
+assert lines[0].endswith("header "+mt) and lines[-1]=="ValueError: "+mt+"-tail" and len(lines)==4, "not joined as expected: %r" % line
+assert labels.get("level")=="warning", "level %r, expected warning (from the header)" % labels.get("level")
+' "$mt" || fail "multiline (structured_metadata=$SM): $(printf '%s' "$mq" | head -c 800)"
+    echo "structured_metadata=$SM: traceback joined into one entry, level from the header"
+  done
+else
+  echo "skipped (E2E_LOCAL: needs the host journal)"
 fi
 
 say "4. Zero AppArmor denials for the profile"
