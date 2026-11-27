@@ -21,6 +21,8 @@
 #   9. host_label: the line carries a static host label and no hostname
 #  10. strip_ansi: colour codes are gone from the stored line, and the level
 #      token behind one is still found
+#  11. multiline_containers: a Python traceback written line by line arrives as
+#      one entry with the header's level, on the JSON and the plain path
 #   4. the kernel logged ZERO apparmor DENIED (or ALLOWED) events for the
 #      profile - last, so it covers every run above
 #
@@ -502,6 +504,55 @@ if [ -z "$LOCAL" ]; then
   case "$LEVEL_LINE" in "WARNING coloured token "*) : ;; *) fail "stored line is not the stripped text: $(printf '%q' "$LEVEL_LINE")" ;; esac
   echo "colour codes stripped, level read behind them"
   CUR_JOB="systemd-journal"
+else
+  echo "skipped (E2E_LOCAL: needs the host journal)"
+fi
+
+say "11. multiline_containers: a traceback becomes one entry"
+if [ -z "$LOCAL" ]; then
+  for SM in true false; do
+    start_addon "{\"loki_url\":\"$LOKI_PUSH\",\"job\":\"e2e-multi\",\"structured_metadata\":$SM,\"level_from_message\":true,\"multiline_containers\":\"e2e-python\"}"
+    mt="ml-$RUN_ID-$RANDOM"
+    # Five entries as Docker's journald driver writes a Python traceback: a
+    # header, three continuation lines, the next record. Through a file, as
+    # in probe_level, so no command line carries the probe text.
+    {
+      printf '%s\n' "2026-01-01 00:00:00.000 WARNING (MainThread) [e2e] header $mt"
+      printf '%s\n' "Traceback (most recent call last):"
+      printf '%s\n' '  File "e2e.py", line 1, in <module>'
+      printf '%s\n' "ValueError: $mt-tail"
+      printf '%s\n' "2026-01-01 00:00:01.000 INFO (MainThread) [e2e] next $mt-next"
+    } > /tmp/ci-multi.txt
+    sudo python3 - /tmp/ci-multi.txt <<'PY'
+import sys
+from systemd import journal
+for line in open(sys.argv[1]).read().splitlines():
+    journal.send(line, CONTAINER_NAME="e2e-python", PRIORITY=3, SYSLOG_IDENTIFIER="ci-probe")
+PY
+    mq=""
+    for _ in $(seq 1 24); do
+      sleep 5
+      mq=$(curl -sG "$LOKI_QUERY/loki/api/v1/query_range" \
+            --data-urlencode "query={job=\"e2e-multi\"} |= \"$mt-tail\"" \
+            --data-urlencode "start=$(( $(date +%s) - 900 ))000000000" \
+            --data-urlencode "end=$(( $(date +%s) + 60 ))000000000" --data-urlencode "limit=10")
+      case "$mq" in *"$mt-tail"*) break ;; esac
+    done
+    # Exactly one entry holds the tail, it starts with the header, has four
+    # lines, and carries the header's level.
+    printf '%s' "$mq" | python3 -c '
+import json,sys
+mt=sys.argv[1]
+r=json.load(sys.stdin)["data"]["result"]
+vals=[(s["stream"],v[1]) for s in r for v in s["values"]]
+assert len(vals)==1, "expected one entry holding the tail, got %d: %r" % (len(vals), vals)
+labels,line=vals[0]
+lines=line.split("\n")
+assert lines[0].endswith("header "+mt) and lines[-1]=="ValueError: "+mt+"-tail" and len(lines)==4, "not joined as expected: %r" % line
+assert labels.get("level")=="warning", "level %r, expected warning (from the header)" % labels.get("level")
+' "$mt" || fail "multiline (structured_metadata=$SM): $(printf '%s' "$mq" | head -c 800)"
+    echo "structured_metadata=$SM: traceback joined into one entry, level from the header"
+  done
 else
   echo "skipped (E2E_LOCAL: needs the host journal)"
 fi

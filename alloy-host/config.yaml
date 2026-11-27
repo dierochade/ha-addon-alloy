@@ -54,6 +54,7 @@ options:
   loki_bearer_token: ""
   loki_tenant_id: ""
   host_label: ""
+  multiline_containers: ""
   metrics_url: ""
   metrics_token: ""
   metrics_remote_write_url: ""
@@ -79,6 +80,9 @@ schema:
   # A static `host` stream label in place of `hostname`, for a Loki whose other
   # sources name the machine that way. Empty = hostname as chosen above.
   host_label: "str?"
+  # A regex of container names (e.g. homeassistant|hassio_supervisor) whose
+  # Python tracebacks are joined into one entry. Empty = off.
+  multiline_containers: "str?"
   loki_username: "str?"
   loki_password: "password?"
   loki_bearer_token: "password?"

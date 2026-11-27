@@ -65,6 +65,13 @@ configuration:
       Assistant, the Supervisor and Zigbee2MQTT colour their logs; in Grafana
       the codes show up as garbage and break text searches. Off keeps the
       lines as the journal recorded them.
+  multiline_containers:
+    name: Join tracebacks (containers)
+    description: >-
+      Regex of container names whose Python tracebacks become one entry
+      instead of one per line, e.g. homeassistant|hassio_supervisor. A line
+      that does not start with a timestamp is appended to the record before
+      it (up to 3 s, 128 lines). Empty = off.
   host_label:
     name: Host label
     description: >-

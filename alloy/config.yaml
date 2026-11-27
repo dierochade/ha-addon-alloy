@@ -11,7 +11,7 @@ name: Alloy
 # every change to the image, the profile or the options needs a new revision
 # (the gate says which), and on a Renovate base image bump the revision bot
 # (.github/workflows/revision.yaml) writes it.
-version: "1.21.3.4"
+version: "1.21.3.5"
 slug: alloy
 description: >-
   Ship the Home Assistant OS systemd journal to Loki with Grafana Alloy.
@@ -64,6 +64,7 @@ options:
   loki_bearer_token: ""
   loki_tenant_id: ""
   host_label: ""
+  multiline_containers: ""
   metrics_enabled: false
   metrics_url: ""
   metrics_token: ""
@@ -87,6 +88,9 @@ schema:
   # A static `host` stream label in place of `hostname`, for a Loki whose other
   # sources name the machine that way. Empty = hostname as chosen above.
   host_label: "str?"
+  # A regex of container names (e.g. homeassistant|hassio_supervisor) whose
+  # Python tracebacks are joined into one entry. Empty = off.
+  multiline_containers: "str?"
   # Loki authentication: basic auth OR a bearer token (the generator refuses
   # both), and the X-Scope-OrgID tenant for a multi-tenant Loki.
   loki_username: "str?"

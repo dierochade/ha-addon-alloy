@@ -16,6 +16,16 @@ goes directly under the marker below, which Renovate needs to find its
 heading.
 
 <!-- renovate:alloy-release -->
+## 1.21.3.5
+
+- New option `multiline_containers`: a regex of container names whose
+  Python tracebacks are joined into one entry instead of one per line
+  (Home Assistant: `homeassistant|hassio_supervisor`). Empty by default.
+- On the JSON path (`structured_metadata`) the line becomes the journal
+  MESSAGE right after the fields are extracted, not at the end of the
+  pipeline. Every stage that reads text now reads the plain MESSAGE on
+  both paths. What is shipped does not change.
+
 ## 1.21.3.4
 
 - `level_from_message` also reads a lowercase level when it is the line's
