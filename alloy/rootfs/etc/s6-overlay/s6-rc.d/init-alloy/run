@@ -311,7 +311,9 @@ cat >> "${CONFIG_FILE}" <<EOF
   // Docker's journald driver logs a container's stderr at priority err, so a
   // WARN or INFO line written to stderr arrives as level="error". Scoped to
   // container streams at that priority; the level is re-derived from the
-  // message (logfmt level=..., or a bare LEVEL token) and falls back to "error".
+  // message (logfmt level=..., a bare LEVEL token, or a lowercase level as the
+  // line's first word, "info: ..." / "s6-rc: info: ..." / "[warn] ...") and
+  // falls back to "error".
   stage.match {
     selector = "{level=\\"error\\", container_name=~\\".+\\"}"
 
@@ -323,11 +325,18 @@ ${LEVEL_SOURCE}
 ${LEVEL_SOURCE}
       expression = "(?:^|\\\\s)(?P<bare_level>TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL|CRITICAL)(?:\\\\s|:)"
     }
+    // Lowercase only where it can only be a level: first word of the line,
+    // optionally behind one "program: " prefix (s6-overlay, bashio), as
+    // "level:" or "[level]". "disk info: low" stays untouched.
+    stage.regex {
+${LEVEL_SOURCE}
+      expression = "^(?:[\\\\w./-]+: )?\\\\[?(?P<prefix_level>trace|debug|info|notice|warn|warning|error|fatal|critical)(?:\\\\]|:)(?:\\\\s|$)"
+    }
 EOF
 cat >> "${CONFIG_FILE}" <<'EOF'
     stage.template {
       source   = "derived_level"
-      template = "{{ if .logfmt_level }}{{ if eq .logfmt_level \"warn\" }}warning{{ else if eq .logfmt_level \"critical\" }}crit{{ else }}{{ .logfmt_level }}{{ end }}{{ else if .bare_level }}{{ if eq .bare_level \"TRACE\" }}trace{{ else if eq .bare_level \"DEBUG\" }}debug{{ else if eq .bare_level \"INFO\" }}info{{ else if eq .bare_level \"WARN\" }}warning{{ else if eq .bare_level \"WARNING\" }}warning{{ else if eq .bare_level \"ERROR\" }}error{{ else if eq .bare_level \"FATAL\" }}fatal{{ else if eq .bare_level \"CRITICAL\" }}crit{{ else }}error{{ end }}{{ else }}error{{ end }}"
+      template = "{{ if .logfmt_level }}{{ if eq .logfmt_level \"warn\" }}warning{{ else if eq .logfmt_level \"critical\" }}crit{{ else }}{{ .logfmt_level }}{{ end }}{{ else if .bare_level }}{{ if eq .bare_level \"TRACE\" }}trace{{ else if eq .bare_level \"DEBUG\" }}debug{{ else if eq .bare_level \"INFO\" }}info{{ else if eq .bare_level \"WARN\" }}warning{{ else if eq .bare_level \"WARNING\" }}warning{{ else if eq .bare_level \"ERROR\" }}error{{ else if eq .bare_level \"FATAL\" }}fatal{{ else if eq .bare_level \"CRITICAL\" }}crit{{ else }}error{{ end }}{{ else if .prefix_level }}{{ if eq .prefix_level \"warn\" }}warning{{ else if eq .prefix_level \"critical\" }}crit{{ else }}{{ .prefix_level }}{{ end }}{{ else }}error{{ end }}"
     }
     stage.labels {
       values = {

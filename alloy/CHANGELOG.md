@@ -16,6 +16,14 @@ goes directly under the marker below, which Renovate needs to find its
 heading.
 
 <!-- renovate:alloy-release -->
+## 1.21.3.4
+
+- `level_from_message` also reads a lowercase level when it is the line's
+  first word, optionally behind one `program: ` prefix: `info: ...`,
+  `s6-rc: info: ...`, `[warn] ...`. Every s6-overlay and bashio start-up
+  line arrived as `level="error"` before. A lowercase word anywhere else
+  ("disk info: low") is still not a level.
+
 ## 1.21.3.3
 
 - New option `strip_ansi`: removes terminal colour codes from every line

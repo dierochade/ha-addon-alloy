@@ -345,6 +345,9 @@ if [ -z "$LOCAL" ]; then
   probe_level warning "level=warn container said so"
   probe_level error   "a plain line with no level token" "CONTAINER_TAG=level=info"
   probe_level info    "INFO: bare token form"
+  probe_level info    "s6-rc: info: service e2e successfully started"
+  probe_level warning "[warn] bracketed lowercase"
+  probe_level error   "disk info: not a level token"
 fi
 
 say "3b. level_from_message on the plain (non-JSON) path"
@@ -354,6 +357,9 @@ if [ -z "$LOCAL" ]; then
   probe_level warning "level=warn container said so"
   probe_level error   "a plain line with no level token" "CONTAINER_TAG=level=info"
   probe_level info    "INFO: bare token form"
+  probe_level info    "s6-rc: info: service e2e successfully started"
+  probe_level warning "[warn] bracketed lowercase"
+  probe_level error   "disk info: not a level token"
   CUR_JOB="systemd-journal"
 else
   echo "skipped (E2E_LOCAL: needs the host journal)"
