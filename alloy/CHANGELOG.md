@@ -16,6 +16,13 @@ goes directly under the marker below, which Renovate needs to find its
 heading.
 
 <!-- renovate:alloy-release -->
+## 1.21.3.2
+
+- New option `host_label`: a static `host` stream label in place of
+  `hostname`, for a Grafana Loki whose other sources already name the machine
+  with `host` (ecohash-co/ha-addon-alloy#13 asked for the same). Empty by
+  default, so nothing changes for an existing install.
+
 ## 1.21.3.1
 
 - AppArmor: accept stop signals from `runc`. On hosts where runc has an
