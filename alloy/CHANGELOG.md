@@ -16,6 +16,12 @@ goes directly under the marker below, which Renovate needs to find its
 heading.
 
 <!-- renovate:alloy-release -->
+## 1.21.3.3
+
+- New option `strip_ansi`: removes terminal colour codes from every line
+  before anything else reads it. Home Assistant, the Supervisor and
+  Zigbee2MQTT colour their output. Off by default.
+
 ## 1.21.3.2
 
 - New option `host_label`: a static `host` stream label in place of

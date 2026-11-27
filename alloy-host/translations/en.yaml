@@ -58,6 +58,13 @@ configuration:
       WARN or INFO lines arrive as level=error. When on, container lines at
       that priority get their level from the message text (level=... or a
       bare WARN/INFO/... token). Off keeps the journal's own priority.
+  strip_ansi:
+    name: Strip ANSI colour codes
+    description: >-
+      Removes terminal colour codes (ESC [ ... m) from every line. Home
+      Assistant, the Supervisor and Zigbee2MQTT colour their logs; in Grafana
+      the codes show up as garbage and break text searches. Off keeps the
+      lines as the journal recorded them.
   host_label:
     name: Host label
     description: >-

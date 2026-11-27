@@ -19,6 +19,8 @@
 #   8. a localhost loki_url and contradictory credentials are refused with a
 #      reason; a job with quotes and backslashes ships as that exact label
 #   9. host_label: the line carries a static host label and no hostname
+#  10. strip_ansi: colour codes are gone from the stored line, and the level
+#      token behind one is still found
 #   4. the kernel logged ZERO apparmor DENIED (or ALLOWED) events for the
 #      profile - last, so it covers every run above
 #
@@ -200,7 +202,9 @@ PY
           --data-urlencode "end=$(( $(date +%s) + 60 ))000000000" --data-urlencode "limit=5")
     case "$q" in *"$text"*)
       hit=$(printf '%s' "$q" | python3 -c 'import json,sys; r=json.load(sys.stdin)["data"]["result"]; print(json.dumps([{"labels": x["stream"], "line": x["values"][0][1][:80]} for x in r]))')
-      got=$(printf '%s' "$q" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["result"][0]["stream"].get("level",""))'); break ;;
+      got=$(printf '%s' "$q" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["result"][0]["stream"].get("level",""))')
+      # The stored line itself, for steps that check what the pipeline did to the text.
+      LEVEL_LINE=$(printf '%s' "$q" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["result"][0]["values"][0][1])'); break ;;
     esac
   done
   [ "$got" = "$want" ] || fail "level for message '$msg' ($*) is '$got', expected '$want'; matched: $hit"
@@ -477,6 +481,23 @@ if [ -z "$LOCAL" ]; then
   printf '%s' "$STREAM" | python3 -c 'import json,sys; l=json.load(sys.stdin)["labels"]; sys.exit(0 if l.get("host")=="e2e-haos" else 1)' \
     || fail "host label wrong: $STREAM"
   echo "host label set, hostname gone"
+fi
+
+say "10. strip_ansi: colour codes removed before the level is read"
+if [ -z "$LOCAL" ]; then
+  # JSON path (structured_metadata), the one where the text is an extracted
+  # field rather than the line: the harder case for a replace stage.
+  start_addon "{\"loki_url\":\"$LOKI_PUSH\",\"job\":\"e2e-ansi\",\"structured_metadata\":true,\"level_from_message\":true,\"strip_ansi\":true}"
+  CUR_JOB="e2e-ansi"
+  # ESC[1;33m directly before the token: without the strip, "mWARNING" is no
+  # bare token and the line would fall back to error.
+  probe_level warning $'\e[1;33mWARNING\e[0m coloured token'
+  case "$LEVEL_LINE" in *$'\e'*) fail "colour code left in the stored line: $(printf '%q' "$LEVEL_LINE")" ;; esac
+  case "$LEVEL_LINE" in "WARNING coloured token "*) : ;; *) fail "stored line is not the stripped text: $(printf '%q' "$LEVEL_LINE")" ;; esac
+  echo "colour codes stripped, level read behind them"
+  CUR_JOB="systemd-journal"
+else
+  echo "skipped (E2E_LOCAL: needs the host journal)"
 fi
 
 say "4. Zero AppArmor denials for the profile"

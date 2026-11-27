@@ -46,6 +46,7 @@ HOST_LABEL=$(opt '.host_label // ""')
 STREAM_LABELS=$(opt '(.stream_labels // ["hostname","unit","level"]) | join(" ")')
 STRUCTURED_METADATA=$(opt '.structured_metadata // false')
 LEVEL_FROM_MESSAGE=$(opt '.level_from_message // false')
+STRIP_ANSI=$(opt '.strip_ansi // false')
 METRICS_ENABLED=$(opt '.metrics_enabled // false')
 ADDITIONAL_CONFIG=$(opt '.additional_config // ""')
 
@@ -202,6 +203,7 @@ echo " Log level: ${LOG_LEVEL}"
 echo " job: ${JOB}   stream labels: ${STREAM_LABELS}"
 [ -n "${HOST_LABEL}" ] && echo " host label: ${HOST_LABEL} (replaces hostname)"
 echo " structured metadata: ${STRUCTURED_METADATA}   level from message: ${LEVEL_FROM_MESSAGE}"
+echo " strip ANSI colours: ${STRIP_ANSI}"
 echo "-----------------------------------------------------------"
 
 # ── Source and stream labels ────────────────────────────────────────────────
@@ -271,6 +273,24 @@ cat >> "${CONFIG_FILE}" <<'EOF'
       transport         = "_TRANSPORT",
       priority          = "PRIORITY",
     }
+  }
+EOF
+fi
+
+# strip_ansi runs before everything that reads the text (level_from_message),
+# so a colour code can never sit between a timestamp and its level token.
+if [ "${STRIP_ANSI}" = "true" ]; then
+    ANSI_SOURCE=""
+    [ "${USE_JSON}" = "true" ] && ANSI_SOURCE='    source     = "message"'
+cat >> "${CONFIG_FILE}" <<EOF
+
+  // strip_ansi: terminal colour codes (ESC [ ... letter) out of the line, as
+  // Home Assistant, the Supervisor and Zigbee2MQTT write them. On the JSON
+  // path from the MESSAGE that stage.output restores at the end.
+  stage.replace {
+${ANSI_SOURCE}
+    expression = "(\\\\x1b\\\\[[0-9;?]*[A-Za-z])"
+    replace    = ""
   }
 EOF
 fi

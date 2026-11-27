@@ -44,6 +44,7 @@ options:
     - level
   structured_metadata: false
   level_from_message: false
+  strip_ansi: false
   metrics_enabled: false
   # Optional keys listed with "" so the form shows them (it hides optional
   # keys absent from options). "" is valid for str/password, not for url -
@@ -74,6 +75,7 @@ schema:
     - "list(hostname|unit|level|syslog_identifier|container_name|transport|priority)"
   structured_metadata: bool
   level_from_message: bool
+  strip_ansi: bool
   # A static `host` stream label in place of `hostname`, for a Loki whose other
   # sources name the machine that way. Empty = hostname as chosen above.
   host_label: "str?"
