@@ -16,6 +16,13 @@ goes directly under the marker below, which Renovate needs to find its
 heading.
 
 <!-- renovate:alloy-release -->
+## 1.21.3.2-local
+
+Local build of dierochade/ha-addon-alloy (branch `local`): 1.21.3.2 plus
+the AppArmor fix from sporqist/ha-addon-alloy#38 (`/etc/ssl/openssl.cnf`
+for the HEALTHCHECK's curl on AppArmor 3.1.7), built on the Home Assistant
+host instead of pulled from GHCR.
+
 ## 1.21.3.2
 
 - New option `host_label`: a static `host` stream label in place of

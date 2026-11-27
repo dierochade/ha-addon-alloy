@@ -11,18 +11,17 @@ name: Alloy
 # every change to the image, the profile or the options needs a new revision
 # (the gate says which), and on a Renovate base image bump the revision bot
 # (.github/workflows/revision.yaml) writes it.
-version: "1.21.3.2"
+version: "1.21.3.2-local"
 slug: alloy
 description: >-
   Ship the Home Assistant OS systemd journal to Loki with Grafana Alloy.
   Replacement for the abandoned Promtail add-on.
-url: https://github.com/sporqist/ha-addon-alloy
+url: https://github.com/dierochade/ha-addon-alloy
 arch:
   - aarch64
   - amd64
-# Pre-built by CI (home-assistant/builder actions) and pulled, never compiled
-# on the Home Assistant host.
-image: ghcr.io/sporqist/ha-addon-alloy
+# LOCAL BRANCH: no `image:` - the Supervisor builds this Dockerfile on the
+# Home Assistant host (docker buildx). Never merge this branch upstream.
 init: false
 startup: services
 # The one privilege this add-on needs: the host journal, read-only.
