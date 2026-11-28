@@ -14,10 +14,24 @@
 #   3. with OPINIONATED options (custom job, more labels, structured metadata,
 #      level_from_message): the config validates under the profile and the line
 #      arrives under the custom job with the extra labels present
-#   5-6. metrics (and host metrics for alloy-host) reach a real Prometheus
+#   5-6. metrics (and host metrics for alloy-host) reach a real Prometheus;
+#      host_metrics: false renders no exporter
 #   7. basic auth, a bearer token and a tenant reach a Loki that checks them
-#   8. a localhost loki_url and contradictory credentials are refused with a
-#      reason; a job with quotes and backslashes ships as that exact label
+#   8. a localhost loki_url, contradictory credentials and an invalid
+#      multiline_containers regex are refused with a reason; a job with
+#      quotes and backslashes ships as that exact label; a password in the
+#      URL is masked in the log
+#   9. host_label: the line carries a static host label and no hostname
+#  10. strip_ansi: colour codes are gone from the stored line, and the level
+#      token behind one is still found
+#  11. multiline_containers: a Python traceback written line by line arrives as
+#      one entry with the header's level, on the JSON and the plain path
+#  12. a Loki outage: with the default loki_max_retries (0) a line written
+#      while Loki is down arrives after it returns and nothing is dropped;
+#      with loki_max_retries 1 the batch is dropped
+#  13. a single Alloy crash is restarted in place; three within 60 s stop the
+#      container with 128 + the signal as its exit code
+#   5. (also) self_metrics: Alloy's own series reach Prometheus as job=alloy
 #   4. the kernel logged ZERO apparmor DENIED (or ALLOWED) events for the
 #      profile - last, so it covers every run above
 #
@@ -133,30 +147,43 @@ expect_refusal() {
 # lq <value>: the value inside a double-quoted LogQL or JSON string.
 lq() { local s="${1//\\/\\\\}"; printf '%s' "${s//\"/\\\"}"; }
 
+# write_probe <probe-text>: one line into the runner's journal (CI only).
+write_probe() {
+  local text="$1"
+  # Inside a transient unit, so the line carries _SYSTEMD_UNIT like a real
+  # service's does; a bare `logger` from the runner's session has none, and
+  # the exact-label assertion below would then rightly find `unit` missing.
+  # The unit's own stdout is the journal stream, created by systemd with the
+  # unit identity attached - no sender-cgroup lookup, so no attribution race
+  # (logger from a short-lived process lost _SYSTEMD_UNIT on the runner).
+  # The text is read from a file, not passed as an argument: systemd logs
+  # "Started <unit> - <command line>" and that line would match the probe
+  # query before the probe itself does.
+  printf '%s\n' "$text" > /tmp/ci-probe.txt
+  sudo systemd-run --quiet --wait --unit "ci-probe-$RANDOM" -p SyslogIdentifier=ci-probe cat /tmp/ci-probe.txt
+}
+
 # probe <job> <probe-text>: write the probe (journal, or a direct push locally)
 # and wait for it under {job=<job>} in Loki. Leaves the matching stream's JSON
 # in $STREAM.
 STREAM=""
 probe() {
-  local job="$1" text="$2" q="" found=""
+  local job="$1" text="$2"
   if [ -n "$LOCAL" ]; then
     docker exec "$NAME" curl -sf -X POST -H 'Content-Type: application/json' \
       -d "{\"streams\":[{\"stream\":{\"job\":\"$(lq "$job")\",\"e2e\":\"local\"},\"values\":[[\"$(date +%s)000000000\",\"$text\"]]}]}" \
       "$LOKI_PUSH" || fail "container cannot push to Loki at $LOKI_PUSH"
   else
-    # Inside a transient unit, so the line carries _SYSTEMD_UNIT like a real
-    # service's does; a bare `logger` from the runner's session has none, and
-    # the exact-label assertion below would then rightly find `unit` missing.
-    # The unit's own stdout is the journal stream, created by systemd with the
-    # unit identity attached - no sender-cgroup lookup, so no attribution race
-    # (logger from a short-lived process lost _SYSTEMD_UNIT on the runner).
-    # The text is read from a file, not passed as an argument: systemd logs
-    # "Started <unit> - <command line>" and that line would match the probe
-    # query before the probe itself does.
-    printf '%s\n' "$text" > /tmp/ci-probe.txt
-    sudo systemd-run --quiet --wait --unit "ci-probe-$RANDOM" -p SyslogIdentifier=ci-probe cat /tmp/ci-probe.txt
+    write_probe "$text"
   fi
-  for _ in $(seq 1 24); do
+  wait_line "$job" "$text"
+}
+
+# wait_line <job> <probe-text> [tries]: wait (5 s per try, 24 by default) for
+# the line under {job=<job>} in Loki; leaves the stream's JSON in $STREAM.
+wait_line() {
+  local job="$1" text="$2" tries="${3:-24}" q="" found=""
+  for _ in $(seq 1 "$tries"); do
     sleep 5
     # categorize-labels: stream labels and structured metadata come back apart;
     # without it Loki merges the metadata into the labels of the response.
@@ -199,7 +226,9 @@ PY
           --data-urlencode "end=$(( $(date +%s) + 60 ))000000000" --data-urlencode "limit=5")
     case "$q" in *"$text"*)
       hit=$(printf '%s' "$q" | python3 -c 'import json,sys; r=json.load(sys.stdin)["data"]["result"]; print(json.dumps([{"labels": x["stream"], "line": x["values"][0][1][:80]} for x in r]))')
-      got=$(printf '%s' "$q" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["result"][0]["stream"].get("level",""))'); break ;;
+      got=$(printf '%s' "$q" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["result"][0]["stream"].get("level",""))')
+      # The stored line itself, for steps that check what the pipeline did to the text.
+      LEVEL_LINE=$(printf '%s' "$q" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["result"][0]["values"][0][1])'); break ;;
     esac
   done
   [ "$got" = "$want" ] || fail "level for message '$msg' ($*) is '$got', expected '$want'; matched: $hit"
@@ -291,6 +320,8 @@ want=$(sed -n 's/^version: "\(.*\)"$/\1/p' "$VERSION_SRC" | cut -d. -f1-3)
 have=$(docker run --rm --entrypoint /usr/bin/alloy "$IMAGE" --version | sed -n 's/^alloy, version v\([^ ]*\).*/\1/p')
 echo "config.yaml alloy version=$want  image alloy=$have"
 [ -n "$want" ] && [ "$want" = "$have" ] || fail "version mismatch: the published tag would lie about what is inside"
+# unzip only unpacks Alloy at build time; it must not stay in the image.
+docker run --rm --entrypoint /bin/sh "$IMAGE" -c 'command -v unzip' >/dev/null && fail "unzip is still in the image"
 if [ "$SLUG" != "alloy" ]; then
   # The variant's own version is the base tag it is built on, optionally with
   # a further component for a host-only revision. Renovate writes the plain
@@ -324,6 +355,11 @@ if [ -z "$LOCAL" ]; then
   [ -z "$(our_meta)" ] || fail "structured metadata present although the option defaults off: $STREAM"
   echo "default label set exact; no structured metadata from the add-on"
 fi
+# The HTTP server has no authentication: no profiling endpoints on it. With
+# pprof on, /debug/pprof/cmdline answers with Alloy's command line.
+pprof=$(docker exec "$NAME" sh -c 'curl -s http://127.0.0.1:12345/debug/pprof/cmdline | tr "\0" " "')
+case "$pprof" in *storage.path*) fail "/debug/pprof is served" ;; esac
+echo "no /debug/pprof"
 
 say "3. Opinionated options: custom job, extra labels, metadata, level_from_message"
 start_addon "{\"loki_url\":\"$LOKI_PUSH\",\"log_level\":\"info\",\"job\":\"e2e-custom\",\"stream_labels\":[\"hostname\",\"unit\",\"level\",\"syslog_identifier\"],\"structured_metadata\":true,\"level_from_message\":true}"
@@ -340,6 +376,15 @@ if [ -z "$LOCAL" ]; then
   probe_level warning "level=warn container said so"
   probe_level error   "a plain line with no level token" "CONTAINER_TAG=level=info"
   probe_level info    "INFO: bare token form"
+  probe_level info    "s6-rc: info: service e2e successfully started"
+  probe_level warning "[warn] bracketed lowercase"
+  probe_level error   "disk info: not a level token"
+  # The leftmost level in the head of the line wins; logfmt in any case;
+  # nginx's bracketed lowercase; a logfmt level beyond the head as fallback.
+  probe_level error   "ERROR job failed; retry with level=debug"
+  probe_level info    "time=2026-01-01T00:00:00.000+01:00 level=INFO msg=slog form"
+  probe_level warning "2026/01/01 00:00:00 [warn] 12#12: nginx form"
+  probe_level warning "ts=2026-01-01T00:00:00.123456789Z caller=internal/component/some/long/path/to/file.go:123 component=e2e level=warn msg=late"
 fi
 
 say "3b. level_from_message on the plain (non-JSON) path"
@@ -349,6 +394,15 @@ if [ -z "$LOCAL" ]; then
   probe_level warning "level=warn container said so"
   probe_level error   "a plain line with no level token" "CONTAINER_TAG=level=info"
   probe_level info    "INFO: bare token form"
+  probe_level info    "s6-rc: info: service e2e successfully started"
+  probe_level warning "[warn] bracketed lowercase"
+  probe_level error   "disk info: not a level token"
+  # The leftmost level in the head of the line wins; logfmt in any case;
+  # nginx's bracketed lowercase; a logfmt level beyond the head as fallback.
+  probe_level error   "ERROR job failed; retry with level=debug"
+  probe_level info    "time=2026-01-01T00:00:00.000+01:00 level=INFO msg=slog form"
+  probe_level warning "2026/01/01 00:00:00 [warn] 12#12: nginx form"
+  probe_level warning "ts=2026-01-01T00:00:00.123456789Z caller=internal/component/some/long/path/to/file.go:123 component=e2e level=warn msg=late"
   CUR_JOB="systemd-journal"
 else
   echo "skipped (E2E_LOCAL: needs the host journal)"
@@ -404,7 +458,7 @@ fi
 say "5. Metrics: an authenticated scrape reaches Prometheus through remote_write"
 # The stub 401s anything but the exact token, so this proves the token file
 # is written, read, and sent without a stray newline - not just configured.
-start_addon "{\"loki_url\":\"$LOKI_PUSH\",\"log_level\":\"info\",\"metrics_enabled\":true,\"metrics_url\":\"http://host.docker.internal:$STUB_PORT/metrics\",\"metrics_token\":\"$STUB_TOKEN\",\"metrics_remote_write_url\":\"http://host.docker.internal:$PROM_PORT/api/v1/write\",\"metrics_interval\":\"5s\"}"
+start_addon "{\"loki_url\":\"$LOKI_PUSH\",\"log_level\":\"info\",\"metrics_enabled\":true,\"self_metrics\":true,\"metrics_url\":\"http://host.docker.internal:$STUB_PORT/metrics\",\"metrics_token\":\"$STUB_TOKEN\",\"metrics_remote_write_url\":\"http://host.docker.internal:$PROM_PORT/api/v1/write\",\"metrics_interval\":\"5s\"}"
 tlen=$(docker exec "$NAME" sh -c 'wc -c < /data/metrics.token')
 [ "$tlen" = "${#STUB_TOKEN}" ] || fail "token file is $tlen bytes, token is ${#STUB_TOKEN}: a stray byte (newline?) would break the header"
 [ "$(docker exec "$NAME" stat -c '%a' /data/metrics.token)" = "600" ] || fail "token file is not 0600"
@@ -418,6 +472,18 @@ done
 [ -n "$found" ] || { printf -- '-- stub log --\n'; cat /tmp/stub.log; fail "e2e_stub_up never arrived in Prometheus under job=homeassistant"; }
 grep -q '200 authenticated' /tmp/stub.log || fail "Prometheus has the metric but the stub never saw an authenticated scrape"
 echo "authenticated scrape -> remote_write -> Prometheus: e2e_stub_up{job=\"homeassistant\"} = 1"
+# self_metrics, same run: Alloy's build info and its loki.write counters.
+for m in alloy_build_info loki_write_sent_entries_total; do
+  found=""
+  for _ in $(seq 1 24); do
+    v=$(curl -sG "http://localhost:$PROM_PORT/api/v1/query" --data-urlencode "query=count($m{job=\"alloy\"})" \
+          | python3 -c 'import json,sys; r=json.load(sys.stdin).get("data",{}).get("result",[]); print(r[0]["value"][1] if r else "")' 2>/dev/null || true)
+    [ -n "$v" ] && [ "$v" != "0" ] && { found=1; break; }
+    sleep 5
+  done
+  [ -n "$found" ] || fail "self_metrics: $m{job=\"alloy\"} never arrived in Prometheus"
+done
+echo "self_metrics -> Prometheus: alloy_build_info and loki_write_sent_entries_total under job=alloy"
 
 if [ "$SLUG" = "alloy-host" ]; then
   say "6. Host metrics (alloy-host): the unix exporter's series reach Prometheus"
@@ -432,6 +498,10 @@ if [ "$SLUG" = "alloy-host" ]; then
   done
   [ -n "$found" ] || fail "node_cpu_seconds_total / node_memory_MemTotal_bytes never arrived in Prometheus under job=node"
   echo "unix exporter -> remote_write -> Prometheus: cpu series present, MemTotal > 0"
+  # jq's // reads false like a missing value; the generator must not.
+  start_addon "{\"loki_url\":\"$LOKI_PUSH\",\"log_level\":\"info\",\"host_metrics\":false}"
+  [ "$(docker exec "$NAME" grep -c 'prometheus.exporter.unix' /etc/alloy/config.alloy)" = "0" ] || fail "host_metrics: false still renders the unix exporter"
+  echo "host_metrics: false renders no exporter"
 fi
 
 say "7. Loki authentication: basic auth, bearer token, tenant"
@@ -444,6 +514,7 @@ if [ -z "$LOCAL" ]; then
   [ "$plen" = "${#LOKI_PASS}" ] || fail "password file is $plen bytes, password is ${#LOKI_PASS}"
   [ "$(docker exec "$NAME" stat -c '%a' /data/loki.password)" = "600" ] || fail "password file is not 0600"
   docker exec "$NAME" grep -qF "$LOKI_PASS" /etc/alloy/config.alloy && fail "the password is in the generated config"
+  case "$(docker logs "$NAME" 2>&1)" in *"cross the network unencrypted"*) : ;; *) fail "no warning for basic auth over http://" ;; esac
   probe e2e-basic "ci-probe-basic-$RUN_ID-$RANDOM"
   grep -q 'forwarded 0' /tmp/proxy.log || { cat /tmp/proxy.log; fail "the line arrived, but not through basic auth"; }
   echo "basic auth + tenant: accepted by the proxy, line in Loki"
@@ -459,13 +530,180 @@ fi
 
 say "8. Options that must be refused, and values that must be escaped"
 expect_refusal "{\"loki_url\":\"http://localhost:3100/loki/api/v1/push\"}" "is the add-on itself"
+expect_refusal "{\"loki_url\":\"http://loki.localhost:3100/loki/api/v1/push\"}" "is the add-on itself"
+expect_refusal "{\"loki_url\":\"http://[0:0:0:0:0:0:0:1]:3100/loki/api/v1/push\"}" "is the add-on itself"
+# A password in the URL never reaches the log (which is shipped to Loki).
+SECRET="e2e-secret-$RUN_ID-$RANDOM"
+start_addon "{\"loki_url\":\"${LOKI_PUSH/:\/\//://e2e:$SECRET@}\",\"job\":\"e2e-userinfo\"}"
+case "$(docker logs "$NAME" 2>&1)" in *"$SECRET"*) fail "the password in loki_url is in the add-on log" ;; esac
+case "$(docker logs "$NAME" 2>&1)" in *"://***@"*) : ;; *) fail "the URL in the log is not masked" ;; esac
+echo "password in the URL masked in the log"
 expect_refusal "{\"loki_url\":\"$LOKI_PUSH\",\"loki_username\":\"u\",\"loki_bearer_token\":\"t\"}" "one or the other"
+# Regexes `alloy validate` would pass and Alloy would then fail to build.
+expect_refusal "{\"loki_url\":\"$LOKI_PUSH\",\"multiline_containers\":\"x|y)\"}" "not a valid regex"
+expect_refusal "{\"loki_url\":\"$LOKI_PUSH\",\"multiline_containers\":\"a++\"}" "stacked quantifier"
 # A job with a quote and a backslash is a label value like any other, not
 # the end of an Alloy string.
 QJOB='e2e "quoted" \ job'
 start_addon "$(python3 -c 'import json,sys; print(json.dumps({"loki_url":sys.argv[1],"job":sys.argv[2]}))' "$LOKI_PUSH" "$QJOB")"
 probe "$QJOB" "ci-probe-quoted-$RUN_ID-$RANDOM"
 echo "a job with a quote and a backslash shipped as that label"
+
+say "9. host_label: a static host label in place of hostname"
+start_addon "{\"loki_url\":\"$LOKI_PUSH\",\"job\":\"e2e-host\",\"host_label\":\"e2e-haos\"}"
+probe e2e-host "ci-probe-host-$RUN_ID-$RANDOM"
+if [ -z "$LOCAL" ]; then
+  # hostname is in the default stream_labels; host_label must replace it.
+  assert_labels "host,job,level,unit"
+  printf '%s' "$STREAM" | python3 -c 'import json,sys; l=json.load(sys.stdin)["labels"]; sys.exit(0 if l.get("host")=="e2e-haos" else 1)' \
+    || fail "host label wrong: $STREAM"
+  echo "host label set, hostname gone"
+fi
+
+say "10. strip_ansi: colour codes removed before the level is read"
+if [ -z "$LOCAL" ]; then
+  # JSON path (structured_metadata), the one where the text is an extracted
+  # field rather than the line: the harder case for a replace stage.
+  start_addon "{\"loki_url\":\"$LOKI_PUSH\",\"job\":\"e2e-ansi\",\"structured_metadata\":true,\"level_from_message\":true,\"strip_ansi\":true}"
+  CUR_JOB="e2e-ansi"
+  # ESC[1;33m directly before the token: without the strip, "mWARNING" is no
+  # bare token and the line would fall back to error.
+  probe_level warning $'\e[1;33mWARNING\e[0m coloured token'
+  case "$LEVEL_LINE" in *$'\e'*) fail "colour code left in the stored line: $(printf '%q' "$LEVEL_LINE")" ;; esac
+  case "$LEVEL_LINE" in "WARNING coloured token "*) : ;; *) fail "stored line is not the stripped text: $(printf '%q' "$LEVEL_LINE")" ;; esac
+  echo "colour codes stripped, level read behind them"
+  CUR_JOB="systemd-journal"
+else
+  echo "skipped (E2E_LOCAL: needs the host journal)"
+fi
+
+say "11. multiline_containers: a traceback becomes one entry"
+if [ -z "$LOCAL" ]; then
+  for SM in true false; do
+    start_addon "{\"loki_url\":\"$LOKI_PUSH\",\"job\":\"e2e-multi\",\"structured_metadata\":$SM,\"level_from_message\":true,\"multiline_containers\":\"e2e-python\"}"
+    mt="ml-$RUN_ID-$RANDOM"
+    # Five entries as Docker's journald driver writes a Python traceback: a
+    # header, three continuation lines, the next record. Through a file, as
+    # in probe_level, so no command line carries the probe text.
+    {
+      printf '%s\n' "2026-01-01 00:00:00.000 WARNING (MainThread) [e2e] header $mt"
+      printf '%s\n' "Traceback (most recent call last):"
+      printf '%s\n' '  File "e2e.py", line 1, in <module>'
+      printf '%s\n' "ValueError: $mt-tail"
+      printf '%s\n' "2026-01-01 00:00:01.000 INFO (MainThread) [e2e] next $mt-next"
+    } > /tmp/ci-multi.txt
+    sudo python3 - /tmp/ci-multi.txt <<'PY'
+import sys
+from systemd import journal
+for line in open(sys.argv[1]).read().splitlines():
+    journal.send(line, CONTAINER_NAME="e2e-python", PRIORITY=3, SYSLOG_IDENTIFIER="ci-probe")
+PY
+    mq=""
+    for _ in $(seq 1 24); do
+      sleep 5
+      mq=$(curl -sG "$LOKI_QUERY/loki/api/v1/query_range" \
+            --data-urlencode "query={job=\"e2e-multi\"} |= \"$mt-tail\"" \
+            --data-urlencode "start=$(( $(date +%s) - 900 ))000000000" \
+            --data-urlencode "end=$(( $(date +%s) + 60 ))000000000" --data-urlencode "limit=10")
+      case "$mq" in *"$mt-tail"*) break ;; esac
+    done
+    # Exactly one entry holds the tail, it starts with the header, has four
+    # lines, and carries the header's level.
+    printf '%s' "$mq" | python3 -c '
+import json,sys
+mt=sys.argv[1]
+r=json.load(sys.stdin)["data"]["result"]
+vals=[(s["stream"],v[1]) for s in r for v in s["values"]]
+assert len(vals)==1, "expected one entry holding the tail, got %d: %r" % (len(vals), vals)
+labels,line=vals[0]
+lines=line.split("\n")
+assert lines[0].endswith("header "+mt) and lines[-1]=="ValueError: "+mt+"-tail" and len(lines)==4, "not joined as expected: %r" % line
+assert labels.get("level")=="warning", "level %r, expected warning (from the header)" % labels.get("level")
+' "$mt" || fail "multiline (structured_metadata=$SM): $(printf '%s' "$mq" | head -c 800)"
+    echo "structured_metadata=$SM: traceback joined into one entry, level from the header"
+  done
+else
+  echo "skipped (E2E_LOCAL: needs the host journal)"
+fi
+
+say "12. A Loki outage delays lines; loki_max_retries is honoured"
+if [ -z "$LOCAL" ]; then
+  LOKI_CTR=$(docker ps -q --filter publish=3100 | head -1)
+  [ -n "$LOKI_CTR" ] || fail "cannot find the Loki container (published port 3100)"
+  loki_back() {
+    docker start "$LOKI_CTR" >/dev/null
+    for _ in $(seq 1 40); do curl -sf "$LOKI_QUERY/ready" >/dev/null && return 0; sleep 3; done
+    fail "Loki did not come back after the outage"
+  }
+  # Default: retry until it succeeds. 45 s of outage spans several
+  # retries; nothing may be dropped, and the line arrives once Loki is back
+  # (the next attempt can be a minute or two later: backoff).
+  start_addon "{\"loki_url\":\"$LOKI_PUSH\",\"job\":\"e2e-outage\"}"
+  docker exec "$NAME" grep -q 'max_backoff_retries = 0' /etc/alloy/config.alloy || fail "the default loki_max_retries is not 0"
+  docker stop "$LOKI_CTR" >/dev/null
+  t="ci-probe-outage-$RUN_ID-$RANDOM"
+  write_probe "$t"
+  sleep 45
+  loki_back
+  case "$(docker logs "$NAME" 2>&1)" in *"dropping data"*) fail "a batch was dropped during the outage although retries are unlimited" ;; esac
+  wait_line e2e-outage "$t" 60
+  echo "45 s Loki outage: the line arrived after Loki came back, nothing dropped"
+
+  # loki_max_retries 1: the batch is gone within seconds, and Alloy says so.
+  start_addon "{\"loki_url\":\"$LOKI_PUSH\",\"job\":\"e2e-drop\",\"loki_max_retries\":1}"
+  docker stop "$LOKI_CTR" >/dev/null
+  write_probe "ci-probe-drop-$RUN_ID-$RANDOM"
+  dropped=""
+  for _ in $(seq 1 30); do
+    case "$(docker logs "$NAME" 2>&1)" in *"dropping data"*) dropped=1; break ;; esac
+    sleep 2
+  done
+  loki_back
+  [ -n "$dropped" ] || fail "loki_max_retries 1: no batch was dropped during the outage"
+  echo "loki_max_retries 1: the batch was dropped after one retry"
+else
+  echo "skipped (E2E_LOCAL: needs the CI Loki container)"
+fi
+
+say "13. Crashes: one is restarted in place, a series stops the add-on"
+if [ -z "$LOCAL" ]; then
+  start_addon "{\"loki_url\":\"$LOKI_PUSH\",\"job\":\"e2e-crash\"}"
+  SVC=/run/service/alloy
+  # crash: SIGKILL Alloy through s6 once it is up (a kill while it is down
+  # between two spawns would hit nothing and count nothing).
+  crash() {
+    local up=""
+    for _ in $(seq 1 30); do
+      [ "$(docker exec "$NAME" /command/s6-svstat -o up "$SVC" 2>/dev/null)" = "true" ] && { up=1; break; }
+      sleep 1
+    done
+    [ -n "$up" ] || fail "Alloy is not up to be killed"
+    docker exec "$NAME" /command/s6-svc -k "$SVC"
+  }
+  crash
+  ready=""
+  for _ in $(seq 1 30); do
+    sleep 2
+    docker exec "$NAME" curl -sf -o /dev/null http://127.0.0.1:12345/-/ready && { ready=1; break; }
+  done
+  [ -n "$ready" ] || fail "Alloy did not come back after one crash"
+  case "$(docker logs "$NAME" 2>&1)" in *"restarting (1 of 3"*) : ;; *) fail "the finish script did not count the crash" ;; esac
+  echo "one crash: restarted in place, ready again"
+  crash; crash
+  running=true
+  for _ in $(seq 1 30); do
+    running=$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null || echo false)
+    [ "$running" = "false" ] && break
+    sleep 1
+  done
+  [ "$running" = "false" ] || fail "three crashes within 60 s, and the add-on is still running"
+  code=$(docker inspect -f '{{.State.ExitCode}}' "$NAME")
+  [ "$code" = "137" ] || fail "the add-on stopped with exit code $code, expected 137 (128 + SIGKILL)"
+  case "$(docker logs "$NAME" 2>&1)" in *"stopping the add-on"*) : ;; *) fail "the add-on stopped without saying why" ;; esac
+  echo "three crashes within 60 s: the add-on stopped, exit code $code"
+else
+  echo "skipped (E2E_LOCAL: no AppArmor, but the s6 behaviour is the same; run it in CI)"
+fi
 
 say "4. Zero AppArmor denials for the profile"
 if [ -n "$LOCAL" ]; then

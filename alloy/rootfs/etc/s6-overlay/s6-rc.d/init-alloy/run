@@ -32,6 +32,20 @@ alloy_str() {
     local s="${1//\\/\\\\}"
     printf '%s' "${s//\"/\\\"}"
 }
+# redact <url>: the URL with a user:password@ part masked, for the log. The
+# add-on's log is in the journal, and with this add-on in Loki as well.
+redact() { printf '%s' "$1" | sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://)[^/@]*@#\1***@#'; }
+# cleartext_creds <url> <auth-kind>: warn when credentials go to an http:// URL.
+cleartext_creds() {
+    local userinfo=""
+    [[ "$1" =~ ^[A-Za-z][A-Za-z0-9+.-]*://[^/@]*@ ]] && userinfo=" (in the URL)"
+    case "$1" in
+        [Hh][Tt][Tt][Pp]://*)
+            if [ "$2" != "none" ] || [ -n "${userinfo}" ]; then
+                echo " WARNING: $(redact "$1") is http:// - the credentials${userinfo} cross the network unencrypted. Use https:// unless every hop is a network you trust."
+            fi ;;
+    esac
+}
 # duration <option> <value>: an interval Alloy and timeout_for both understand.
 duration() {
     [[ "$2" =~ ^[0-9]+[smh]$ ]] && return 0
@@ -41,10 +55,41 @@ duration() {
 LOKI_URL=$(opt '.loki_url // ""')
 LOG_LEVEL=$(optd log_level info)
 JOB=$(optd job systemd-journal)
+# host_label: a static `host` stream label in place of `hostname`.
+HOST_LABEL=$(opt '.host_label // ""')
 STREAM_LABELS=$(opt '(.stream_labels // ["hostname","unit","level"]) | join(" ")')
 STRUCTURED_METADATA=$(opt '.structured_metadata // false')
 LEVEL_FROM_MESSAGE=$(opt '.level_from_message // false')
+STRIP_ANSI=$(opt '.strip_ansi // false')
+# multiline_containers: a regex of container names whose Python tracebacks are
+# joined into one entry. Empty = off. It lands inside a LogQL selector inside an
+# Alloy string, so only regex characters are accepted: no quotes, backslashes,
+# braces or spaces, and nothing has to be escaped twice.
+MULTILINE_CONTAINERS=$(opt '.multiline_containers // ""')
+if [ -n "${MULTILINE_CONTAINERS}" ]; then
+    # shellcheck disable=SC2016 # a literal regex: $ is an anchor, not an expansion
+    ml_re='^[][A-Za-z0-9_.|*+?^$()-]+$'
+    if ! [[ "${MULTILINE_CONTAINERS}" =~ ${ml_re} ]]; then
+        echo "!! multiline_containers may only hold a regex of container names (letters, digits, _ . - and | * + ? ^ \$ ( ) [ ]), not '${MULTILINE_CONTAINERS}'"
+        exit 1
+    fi
+    # The allowlist keeps the quoting safe; it does not make a valid regex.
+    # Compile it here (jq's Oniguruma), so "x|y)" or "*x" stops the add-on with
+    # the reason instead of failing inside Alloy at start, after `alloy
+    # validate` passed. Stacked quantifiers are refused by name: Oniguruma
+    # reads "a++" as possessive and "a**" as a nested repeat, and Go's RE2,
+    # which Alloy compiles the selector with, rejects both.
+    if ! ml_err=$(jq -n --arg re "${MULTILINE_CONTAINERS}" '"" | test($re)' 2>&1 >/dev/null); then
+        echo "!! multiline_containers is not a valid regex: '${MULTILINE_CONTAINERS}' (${ml_err##*: })"
+        exit 1
+    fi
+    if [[ "${MULTILINE_CONTAINERS}" =~ [*+?][*+] ]]; then
+        echo "!! multiline_containers has a stacked quantifier (such as ** or ++), which Grafana Alloy's regex engine refuses: '${MULTILINE_CONTAINERS}'"
+        exit 1
+    fi
+fi
 METRICS_ENABLED=$(opt '.metrics_enabled // false')
+SELF_METRICS=$(opt '.self_metrics // false')
 ADDITIONAL_CONFIG=$(opt '.additional_config // ""')
 
 has_label() { case " ${STREAM_LABELS} " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
@@ -77,7 +122,9 @@ fi
 VARIANT=$(cat /etc/alloy-addon/variant 2>/dev/null || echo base)
 HOST_METRICS=false
 if [ "${VARIANT}" = "host" ]; then
-    HOST_METRICS=$(opt '.host_metrics // true')
+    # Not `.host_metrics // true`: jq's // treats false like a missing value,
+    # so host_metrics: false would read as on.
+    HOST_METRICS=$(opt 'if .host_metrics == null then true else .host_metrics end')
 fi
 
 # finish: validate the generated file and stop the container on failure.
@@ -137,8 +184,11 @@ if [ -z "${LOKI_URL}" ]; then
     exit 1
 fi
 loki_host=$(printf '%s' "${LOKI_URL}" | sed -E 's#^[A-Za-z][A-Za-z0-9+.-]*://([^/@]*@)?(\[[^]/]*\]|[^]/:]*).*#\2#')
+# A guard rail against the common mistake, not a boundary: every name and
+# literal that is this container's own loopback (RFC 6761 reserves all of
+# *.localhost), plus the unspecified addresses, which reach it as well.
 case "${loki_host,,}" in
-    localhost|localhost.|127.*|0.0.0.0|"[::1]"|"[::]")
+    localhost|localhost.|*.localhost|*.localhost.|localhost.localdomain|ip6-localhost|ip6-loopback|127.*|0|0.0.0.0|"[::1]"|"[::]"|"[0:0:0:0:0:0:0:1]"|"[0:0:0:0:0:0:0:0]"|"[::ffff:127."*|"[::ffff:7f"*)
         echo "!! loki_url points at ${loki_host}, which inside this add-on is the add-on itself - nothing listens there."
         echo "   Use the address of the machine Grafana Loki runs on (its IP or hostname on your network)."
         exit 1 ;;
@@ -187,17 +237,41 @@ if [ -n "${LOKI_TENANT_ID}" ]; then
     tenant_id = \"$(alloy_str "${LOKI_TENANT_ID}")\""
 fi
 
+# loki_max_retries: how often a failed push is retried before its batch is
+# dropped. 0 = until it succeeds, this add-on's default; Alloy's own is 10,
+# about 8.5 to 13.5 minutes of backoff. The source is the journal, which keeps
+# every line until it is read: while a push retries, Alloy's queue fills and
+# the journal reader waits on it, so a Loki outage delays lines instead of
+# losing them. Only the in-memory part (one batch plus the queue) is lost if
+# Alloy restarts during an outage. Non-retryable answers (a 4xx other than
+# 429) drop their batch whatever this is set to.
+LOKI_MAX_RETRIES=$(opt '.loki_max_retries // 0')
+if ! [[ "${LOKI_MAX_RETRIES}" =~ ^[0-9]+$ ]]; then
+    echo "!! loki_max_retries must be a whole number of retries (0 = until it succeeds), not '${LOKI_MAX_RETRIES}'"
+    exit 1
+fi
+if [ "${LOKI_MAX_RETRIES}" = "0" ]; then
+    loki_retries_desc="until it succeeds"
+else
+    loki_retries_desc="${LOKI_MAX_RETRIES} times, then the batch is dropped"
+fi
+
 # Every option that lands inside an Alloy string, escaped once, here.
 LOKI_URL_S=$(alloy_str "${LOKI_URL}")
 JOB_S=$(alloy_str "${JOB}")
+HOST_LABEL_S=$(alloy_str "${HOST_LABEL}")
 
 echo "-----------------------------------------------------------"
 echo " Grafana Alloy for Home Assistant (${VARIANT})"
-echo " Loki URL: ${LOKI_URL}   auth: ${loki_auth_kind}$([ -n "${LOKI_TENANT_ID}" ] && echo "   tenant: ${LOKI_TENANT_ID}")"
+echo " Loki URL: $(redact "${LOKI_URL}")   auth: ${loki_auth_kind}$([ -n "${LOKI_TENANT_ID}" ] && echo "   tenant: ${LOKI_TENANT_ID}")"
+cleartext_creds "${LOKI_URL}" "${loki_auth_kind}"
+echo " Loki push retried: ${loki_retries_desc}"
 echo " Journal path: ${JOURNAL_PATH}"
 echo " Log level: ${LOG_LEVEL}"
 echo " job: ${JOB}   stream labels: ${STREAM_LABELS}"
+[ -n "${HOST_LABEL}" ] && echo " host label: ${HOST_LABEL} (replaces hostname)"
 echo " structured metadata: ${STRUCTURED_METADATA}   level from message: ${LEVEL_FROM_MESSAGE}"
+echo " strip ANSI colours: ${STRIP_ANSI}   multiline containers: ${MULTILINE_CONTAINERS:-off}"
 echo "-----------------------------------------------------------"
 
 # ── Source and stream labels ────────────────────────────────────────────────
@@ -230,17 +304,23 @@ loki.relabel "journal" {
 EOF
 
 relabel() { printf '  rule {\n    source_labels = ["%s"]\n    target_label  = "%s"\n  }\n' "$1" "$2" >> "${CONFIG_FILE}"; }
-has_label hostname          && relabel __journal__hostname        hostname
+# host_label replaces hostname: a stream gets one name for the machine, not two.
+has_label hostname && [ -z "${HOST_LABEL}" ] && relabel __journal__hostname hostname
 has_label unit              && relabel __journal__systemd_unit    unit
 has_label level             && relabel __journal_priority_keyword level
 has_label syslog_identifier && relabel __journal_syslog_identifier syslog_identifier
 has_label container_name    && relabel __journal_container_name   container_name
 has_label transport         && relabel __journal__transport       transport
 has_label priority          && relabel __journal_priority         priority
-# level_from_message needs to know which streams are containers, whether or not
-# container_name was chosen as a label; a temporary label is dropped again below.
+# level_from_message and multiline_containers need to know which streams are
+# containers, whether or not container_name was chosen as a label; temporary
+# labels are dropped again below.
+NEED_CONTAINER=false
+{ [ "${LEVEL_FROM_MESSAGE}" = "true" ] || [ -n "${MULTILINE_CONTAINERS}" ]; } && NEED_CONTAINER=true
 if [ "${LEVEL_FROM_MESSAGE}" = "true" ]; then
     has_label level          || relabel __journal_priority_keyword level
+fi
+if [ "${NEED_CONTAINER}" = "true" ]; then
     has_label container_name || relabel __journal_container_name   container_name
 fi
 echo "}" >> "${CONFIG_FILE}"
@@ -248,13 +328,18 @@ echo "}" >> "${CONFIG_FILE}"
 # ── Pipeline ────────────────────────────────────────────────────────────────
 # The job label first, as a stage: the one place every Alloy version honours
 # it (see the loki.source.journal comment above).
-printf '\nloki.process "journal" {\n  stage.static_labels {\n    values = {\n      job = "%s",\n    }\n  }\n' "${JOB_S}" >> "${CONFIG_FILE}"
+# host_label, when set, is stamped in the same stage.
+host_line=""
+[ -n "${HOST_LABEL}" ] && host_line="      host = \"${HOST_LABEL_S}\","$'\n'
+printf '\nloki.process "journal" {\n  stage.static_labels {\n    values = {\n      job = "%s",\n%s    }\n  }\n' "${JOB_S}" "${host_line}" >> "${CONFIG_FILE}"
 
 if [ "${USE_JSON}" = "true" ]; then
 cat >> "${CONFIG_FILE}" <<'EOF'
-  // Pull the fields structured_metadata carries out of the JSON entry. The
-  // line is the JSON until stage.output restores the MESSAGE at the end, so
-  // every stage in between that reads content must say source = "message".
+  // Pull the fields structured_metadata carries out of the JSON entry, then
+  // make the line the journal MESSAGE again straight away. The fields stay in
+  // the extracted map for structured_metadata; every stage that reads text
+  // (strip_ansi, multiline, level_from_message) reads the plain MESSAGE, as on
+  // the non-JSON path. stage.multiline has no source and must see the MESSAGE.
   stage.json {
     expressions = {
       message           = "MESSAGE",
@@ -262,6 +347,47 @@ cat >> "${CONFIG_FILE}" <<'EOF'
       container_name    = "CONTAINER_NAME",
       transport         = "_TRANSPORT",
       priority          = "PRIORITY",
+    }
+  }
+  stage.output {
+    source = "message"
+  }
+EOF
+fi
+
+# strip_ansi runs before everything that reads the text (level_from_message),
+# so a colour code can never sit between a timestamp and its level token.
+if [ "${STRIP_ANSI}" = "true" ]; then
+cat >> "${CONFIG_FILE}" <<EOF
+
+  // strip_ansi: terminal colour codes (ESC [ ... letter) out of the line, as
+  // Home Assistant, the Supervisor and Zigbee2MQTT write them.
+  stage.replace {
+    expression = "(\\\\x1b\\\\[[0-9;?]*[A-Za-z])"
+    replace    = ""
+  }
+EOF
+fi
+
+# multiline_containers runs after strip_ansi (its firstline still accepts a
+# leading colour code, for strip_ansi off) and BEFORE level_from_message: a
+# header and its traceback lines share one stream only while every line still
+# carries the journal's level; once the level is re-derived per line they would
+# split into different streams and never be joined.
+if [ -n "${MULTILINE_CONTAINERS}" ]; then
+cat >> "${CONFIG_FILE}" <<EOF
+
+  // multiline_containers: Docker's journald driver writes every line of a
+  // Python traceback as an entry of its own. For these containers a line that
+  // does not start a record (a timestamp, or Python's "--- Logging error ---")
+  // is appended to the record before it, per stream, for up to 3 s.
+  stage.match {
+    selector = "{container_name=~\\"${MULTILINE_CONTAINERS}\\"}"
+
+    stage.multiline {
+      firstline     = "^(?:\\\\x1b\\\\[[0-9;]*m)?(?:\\\\d{4}-\\\\d{2}-\\\\d{2}[ T]\\\\d{2}:\\\\d{2}:\\\\d{2}|--- Logging error ---)"
+      max_wait_time = "3s"
+      max_lines     = 128
     }
   }
 EOF
@@ -273,33 +399,42 @@ fi
 # tell container streams apart. Found by the gate: with the order reversed the
 # level was never corrected on the metadata path.
 if [ "${LEVEL_FROM_MESSAGE}" = "true" ]; then
-    # With the JSON path on, the line is the whole journal entry until the end
-    # of the pipeline; the level must be read from the MESSAGE field, or a
-    # level token in any other field (a command line, a tag) would be taken.
-    LEVEL_SOURCE=""
-    [ "${USE_JSON}" = "true" ] && LEVEL_SOURCE='      source     = "message"'
-cat >> "${CONFIG_FILE}" <<EOF
+    # The line is the journal MESSAGE on both paths (stage.output runs right
+    # after stage.json), so a level token in any other field (a command line,
+    # a tag) is never seen. Quoted heredoc: no shell expansion, the regexes
+    # are written once-escaped for the Alloy string.
+cat >> "${CONFIG_FILE}" <<'EOF'
 
   // Docker's journald driver logs a container's stderr at priority err, so a
   // WARN or INFO line written to stderr arrives as level="error". Scoped to
   // container streams at that priority; the level is re-derived from the
-  // message (logfmt level=..., or a bare LEVEL token) and falls back to "error".
+  // message and falls back to "error".
+  //
+  // Only the head of the line counts - its first 80 characters, where loggers
+  // put the level - and there the LEFTMOST level wins, whatever its form:
+  //   a lowercase level as the first word, optionally behind one "program: "
+  //     prefix: "info: ...", "s6-rc: info: ...", "[warn] ..."
+  //   logfmt in any case: "level=warn", "level=INFO" (Go's slog)
+  //   a bare uppercase token: "... WARNING (MainThread) ...", "[INFO]", "ERROR:"
+  //   a lowercase level in brackets: "2026/01/01 00:00:00 [warn] ..." (nginx)
+  // A line that starts with ERROR stays an error, whatever "level=debug" or
+  // "INFO" its text mentions later. "disk info: low" is not a level. A logfmt
+  // level=... beyond the head (a long ts= and caller= in front of it) is the
+  // fallback when the head has none.
   stage.match {
-    selector = "{level=\\"error\\", container_name=~\\".+\\"}"
+    selector = "{level=\"error\", container_name=~\".+\"}"
 
     stage.regex {
-${LEVEL_SOURCE}
-      expression = "(?:^|\\\\s)level=(?P<logfmt_level>trace|debug|info|warn|warning|error|fatal|critical)(?:\\\\s|$)"
+      expression = "^(?:(?:[\\w./-]+: )?\\[?(?P<first_level>trace|debug|info|notice|warn|warning|error|fatal|critical)(?:\\]|:)(?:\\s|$)|.{0,80}?(?:(?:^|\\s)level=(?P<logfmt_level>(?i:trace|debug|info|warn|warning|error|fatal|critical))(?:\\s|$)|(?:^|[\\s\\[])(?P<bare_level>TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL|CRITICAL)(?:[\\s:\\]]|$)|\\[(?P<bracket_level>trace|debug|info|notice|warn|warning|error|fatal|crit|critical)\\]))"
     }
     stage.regex {
-${LEVEL_SOURCE}
-      expression = "(?:^|\\\\s)(?P<bare_level>TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL|CRITICAL)(?:\\\\s|:)"
+      expression = "(?:^|\\s)level=(?P<late_level>(?i:trace|debug|info|warn|warning|error|fatal|critical))(?:\\s|$)"
     }
-EOF
-cat >> "${CONFIG_FILE}" <<'EOF'
+    // One alternative of the head regex matches, so at most one of its groups
+    // is set; coalesce skips the empty ones and the missing late_level.
     stage.template {
       source   = "derived_level"
-      template = "{{ if .logfmt_level }}{{ if eq .logfmt_level \"warn\" }}warning{{ else if eq .logfmt_level \"critical\" }}crit{{ else }}{{ .logfmt_level }}{{ end }}{{ else if .bare_level }}{{ if eq .bare_level \"TRACE\" }}trace{{ else if eq .bare_level \"DEBUG\" }}debug{{ else if eq .bare_level \"INFO\" }}info{{ else if eq .bare_level \"WARN\" }}warning{{ else if eq .bare_level \"WARNING\" }}warning{{ else if eq .bare_level \"ERROR\" }}error{{ else if eq .bare_level \"FATAL\" }}fatal{{ else if eq .bare_level \"CRITICAL\" }}crit{{ else }}error{{ end }}{{ else }}error{{ end }}"
+      template = "{{ $l := ToLower (coalesce .first_level .logfmt_level .bare_level .bracket_level .late_level \"error\") }}{{ if eq $l \"warn\" }}warning{{ else if eq $l \"critical\" }}crit{{ else }}{{ $l }}{{ end }}"
     }
     stage.labels {
       values = {
@@ -308,12 +443,19 @@ cat >> "${CONFIG_FILE}" <<'EOF'
     }
   }
 EOF
-    drop=""
+fi
+
+# Temporary labels level_from_message and multiline_containers needed, dropped
+# before structured_metadata (which would move container_name otherwise).
+drop=""
+if [ "${NEED_CONTAINER}" = "true" ]; then
     has_label container_name || drop="${drop}\"container_name\", "
+fi
+if [ "${LEVEL_FROM_MESSAGE}" = "true" ]; then
     has_label level          || drop="${drop}\"level\", "
-    if [ -n "${drop}" ]; then
-        printf '\n  // Temporary labels level_from_message needed, not chosen in stream_labels.\n  stage.label_drop {\n    values = [%s]\n  }\n' "${drop%, }" >> "${CONFIG_FILE}"
-    fi
+fi
+if [ -n "${drop}" ]; then
+    printf '\n  // Temporary labels, not chosen in stream_labels.\n  stage.label_drop {\n    values = [%s]\n  }\n' "${drop%, }" >> "${CONFIG_FILE}"
 fi
 
 if [ "${STRUCTURED_METADATA}" = "true" ]; then
@@ -330,15 +472,6 @@ if [ "${STRUCTURED_METADATA}" = "true" ]; then
     fi
 fi
 
-if [ "${USE_JSON}" = "true" ]; then
-cat >> "${CONFIG_FILE}" <<'EOF'
-
-  // The line itself is the journal MESSAGE again, not the JSON entry.
-  stage.output {
-    source = "message"
-  }
-EOF
-fi
 cat >> "${CONFIG_FILE}" <<EOF
   stage.drop {
     expression = "^\\\\s*$"
@@ -349,7 +482,8 @@ cat >> "${CONFIG_FILE}" <<EOF
 
 loki.write "loki" {
   endpoint {
-    url = "${LOKI_URL_S}"
+    url                 = "${LOKI_URL_S}"
+    max_backoff_retries = ${LOKI_MAX_RETRIES}
 ${loki_auth}
   }
 }
@@ -374,7 +508,7 @@ timeout_for() {
         echo "10s"
     fi
 }
-if [ "${METRICS_ENABLED}" = "true" ] || [ "${HOST_METRICS}" = "true" ]; then
+if [ "${METRICS_ENABLED}" = "true" ] || [ "${SELF_METRICS}" = "true" ] || [ "${HOST_METRICS}" = "true" ]; then
     # The instance label on every metric. Neither the container nor Alloy knows
     # the Home Assistant OS hostname, so the default is the container's; set
     # metrics_instance to name the host.
@@ -383,7 +517,7 @@ if [ "${METRICS_ENABLED}" = "true" ] || [ "${HOST_METRICS}" = "true" ]; then
     RW_USER=$(opt '.metrics_remote_write_user // ""')
     RW_PASSWORD=$(opt '.metrics_remote_write_password // ""')
     if [ -z "${METRICS_REMOTE_WRITE_URL}" ] || [ "${METRICS_REMOTE_WRITE_URL}" = "null" ]; then
-        echo "!! metrics are on (metrics_enabled or host_metrics) but metrics_remote_write_url is empty - nowhere to send them."
+        echo "!! metrics are on (metrics_enabled, self_metrics or host_metrics) but metrics_remote_write_url is empty - nowhere to send them."
         exit 1
     fi
     # Typed str in the schema so the form can show it empty; the check the url
@@ -404,7 +538,8 @@ if [ "${METRICS_ENABLED}" = "true" ] || [ "${HOST_METRICS}" = "true" ]; then
     else
         rm -f "${RW_PASSWORD_FILE}"
     fi
-    echo " remote_write: ${METRICS_REMOTE_WRITE_URL} (auth: $([ -n "${rw_auth}" ] && echo basic || echo none))"
+    echo " remote_write: $(redact "${METRICS_REMOTE_WRITE_URL}") (auth: $([ -n "${rw_auth}" ] && echo basic || echo none))"
+    cleartext_creds "${METRICS_REMOTE_WRITE_URL}" "$([ -n "${rw_auth}" ] && echo basic || echo none)"
     cat >> "${CONFIG_FILE}" <<EOF
 
 // --- metrics go here ---
@@ -446,7 +581,7 @@ if [ "${METRICS_ENABLED}" = "true" ]; then
     else
         rm -f "${TOKEN_FILE}"
     fi
-    echo " metrics: ${scheme}://${hostport}${path} every ${METRICS_INTERVAL} as job ${METRICS_JOB} (token: $([ -n "${auth}" ] && echo set || echo none))"
+    echo " metrics: $(redact "${scheme}://${hostport}${path}") every ${METRICS_INTERVAL} as job ${METRICS_JOB} (token: $([ -n "${auth}" ] && echo set || echo none))"
     cat >> "${CONFIG_FILE}" <<EOF
 
 // --- Home Assistant metrics (metrics_enabled) ---
@@ -466,6 +601,44 @@ ${auth}
 EOF
 else
     rm -f "${TOKEN_FILE}"
+fi
+
+# ── Grafana Alloy's own metrics (self_metrics) ──────────────────────────────
+# Alloy's /metrics as a scrape target: build info and, per component, the
+# counters that tell a pipeline that ships from one that only runs -
+# loki_write_sent_entries_total, loki_write_dropped_entries_total,
+# loki_write_batch_retries_total. Same remote_write, job "alloy".
+if [ "${SELF_METRICS}" = "true" ]; then
+    SELF_INTERVAL=$(optd metrics_interval 60s)
+    duration metrics_interval "${SELF_INTERVAL}"
+    echo " self metrics: every ${SELF_INTERVAL} as job alloy"
+    cat >> "${CONFIG_FILE}" <<EOF
+
+// --- Grafana Alloy's own metrics (self_metrics) ---
+prometheus.exporter.self "alloy" { }
+
+// The exporter's targets carry a job and instance of their own (the
+// container's hostname), and a target's labels win over job_name. Set both.
+discovery.relabel "self" {
+  targets = prometheus.exporter.self.alloy.targets
+  rule {
+    target_label = "job"
+    replacement  = "alloy"
+  }
+  rule {
+    target_label = "instance"
+    replacement  = "${INSTANCE_S}"
+  }
+}
+
+prometheus.scrape "self" {
+  targets         = discovery.relabel.self.output
+  job_name        = "alloy"
+  scrape_interval = "${SELF_INTERVAL}"
+  scrape_timeout  = "$(timeout_for "${SELF_INTERVAL}")"
+  forward_to      = [prometheus.remote_write.metrics.receiver]
+}
+EOF
 fi
 
 # ── Host metrics (alloy-host variant only) ──────────────────────────────────
