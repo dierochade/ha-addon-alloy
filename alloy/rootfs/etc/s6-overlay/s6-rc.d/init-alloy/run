@@ -75,6 +75,7 @@ if [ -n "${MULTILINE_CONTAINERS}" ]; then
     fi
 fi
 METRICS_ENABLED=$(opt '.metrics_enabled // false')
+SELF_METRICS=$(opt '.self_metrics // false')
 ADDITIONAL_CONFIG=$(opt '.additional_config // ""')
 
 has_label() { case " ${STREAM_LABELS} " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
@@ -219,6 +220,25 @@ if [ -n "${LOKI_TENANT_ID}" ]; then
     tenant_id = \"$(alloy_str "${LOKI_TENANT_ID}")\""
 fi
 
+# loki_max_retries: how often a failed push is retried before its batch is
+# dropped. 0 = until it succeeds, this add-on's default; Alloy's own is 10,
+# about 8.5 to 13.5 minutes of backoff. The source is the journal, which keeps
+# every line until it is read: while a push retries, Alloy's queue fills and
+# the journal reader waits on it, so a Loki outage delays lines instead of
+# losing them. Only the in-memory part (one batch plus the queue) is lost if
+# Alloy restarts during an outage. Non-retryable answers (a 4xx other than
+# 429) drop their batch whatever this is set to.
+LOKI_MAX_RETRIES=$(opt '.loki_max_retries // 0')
+if ! [[ "${LOKI_MAX_RETRIES}" =~ ^[0-9]+$ ]]; then
+    echo "!! loki_max_retries must be a whole number of retries (0 = until it succeeds), not '${LOKI_MAX_RETRIES}'"
+    exit 1
+fi
+if [ "${LOKI_MAX_RETRIES}" = "0" ]; then
+    loki_retries_desc="until it succeeds"
+else
+    loki_retries_desc="${LOKI_MAX_RETRIES} times, then the batch is dropped"
+fi
+
 # Every option that lands inside an Alloy string, escaped once, here.
 LOKI_URL_S=$(alloy_str "${LOKI_URL}")
 JOB_S=$(alloy_str "${JOB}")
@@ -227,6 +247,7 @@ HOST_LABEL_S=$(alloy_str "${HOST_LABEL}")
 echo "-----------------------------------------------------------"
 echo " Grafana Alloy for Home Assistant (${VARIANT})"
 echo " Loki URL: ${LOKI_URL}   auth: ${loki_auth_kind}$([ -n "${LOKI_TENANT_ID}" ] && echo "   tenant: ${LOKI_TENANT_ID}")"
+echo " Loki push retried: ${loki_retries_desc}"
 echo " Journal path: ${JOURNAL_PATH}"
 echo " Log level: ${LOG_LEVEL}"
 echo " job: ${JOB}   stream labels: ${STREAM_LABELS}"
@@ -443,7 +464,8 @@ cat >> "${CONFIG_FILE}" <<EOF
 
 loki.write "loki" {
   endpoint {
-    url = "${LOKI_URL_S}"
+    url                 = "${LOKI_URL_S}"
+    max_backoff_retries = ${LOKI_MAX_RETRIES}
 ${loki_auth}
   }
 }
@@ -468,7 +490,7 @@ timeout_for() {
         echo "10s"
     fi
 }
-if [ "${METRICS_ENABLED}" = "true" ] || [ "${HOST_METRICS}" = "true" ]; then
+if [ "${METRICS_ENABLED}" = "true" ] || [ "${SELF_METRICS}" = "true" ] || [ "${HOST_METRICS}" = "true" ]; then
     # The instance label on every metric. Neither the container nor Alloy knows
     # the Home Assistant OS hostname, so the default is the container's; set
     # metrics_instance to name the host.
@@ -477,7 +499,7 @@ if [ "${METRICS_ENABLED}" = "true" ] || [ "${HOST_METRICS}" = "true" ]; then
     RW_USER=$(opt '.metrics_remote_write_user // ""')
     RW_PASSWORD=$(opt '.metrics_remote_write_password // ""')
     if [ -z "${METRICS_REMOTE_WRITE_URL}" ] || [ "${METRICS_REMOTE_WRITE_URL}" = "null" ]; then
-        echo "!! metrics are on (metrics_enabled or host_metrics) but metrics_remote_write_url is empty - nowhere to send them."
+        echo "!! metrics are on (metrics_enabled, self_metrics or host_metrics) but metrics_remote_write_url is empty - nowhere to send them."
         exit 1
     fi
     # Typed str in the schema so the form can show it empty; the check the url
@@ -560,6 +582,44 @@ ${auth}
 EOF
 else
     rm -f "${TOKEN_FILE}"
+fi
+
+# ── Grafana Alloy's own metrics (self_metrics) ──────────────────────────────
+# Alloy's /metrics as a scrape target: build info and, per component, the
+# counters that tell a pipeline that ships from one that only runs -
+# loki_write_sent_entries_total, loki_write_dropped_entries_total,
+# loki_write_batch_retries_total. Same remote_write, job "alloy".
+if [ "${SELF_METRICS}" = "true" ]; then
+    SELF_INTERVAL=$(optd metrics_interval 60s)
+    duration metrics_interval "${SELF_INTERVAL}"
+    echo " self metrics: every ${SELF_INTERVAL} as job alloy"
+    cat >> "${CONFIG_FILE}" <<EOF
+
+// --- Grafana Alloy's own metrics (self_metrics) ---
+prometheus.exporter.self "alloy" { }
+
+// The exporter's targets carry a job and instance of their own (the
+// container's hostname), and a target's labels win over job_name. Set both.
+discovery.relabel "self" {
+  targets = prometheus.exporter.self.alloy.targets
+  rule {
+    target_label = "job"
+    replacement  = "alloy"
+  }
+  rule {
+    target_label = "instance"
+    replacement  = "${INSTANCE_S}"
+  }
+}
+
+prometheus.scrape "self" {
+  targets         = discovery.relabel.self.output
+  job_name        = "alloy"
+  scrape_interval = "${SELF_INTERVAL}"
+  scrape_timeout  = "$(timeout_for "${SELF_INTERVAL}")"
+  forward_to      = [prometheus.remote_write.metrics.receiver]
+}
+EOF
 fi
 
 # ── Host metrics (alloy-host variant only) ──────────────────────────────────

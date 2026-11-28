@@ -11,7 +11,7 @@ name: Alloy
 # every change to the image, the profile or the options needs a new revision
 # (the gate says which), and on a Renovate base image bump the revision bot
 # (.github/workflows/revision.yaml) writes it.
-version: "1.22.0.1"
+version: "1.22.0.2"
 slug: alloy
 description: >-
   Ship the Home Assistant OS systemd journal to Loki with Grafana Alloy.
@@ -52,6 +52,7 @@ options:
   structured_metadata: false
   level_from_message: false
   strip_ansi: false
+  loki_max_retries: 0
   # Every optional key is listed here with an empty value ON PURPOSE: the
   # configuration form shows an optional field only if the key is present in
   # options (frontend: supervisor-app-config.ts, `entry.name in options ||
@@ -66,6 +67,7 @@ options:
   host_label: ""
   multiline_containers: ""
   metrics_enabled: false
+  self_metrics: false
   metrics_url: ""
   metrics_token: ""
   metrics_remote_write_url: ""
@@ -97,9 +99,14 @@ schema:
   loki_password: "password?"
   loki_bearer_token: "password?"
   loki_tenant_id: "str?"
+  # How often a failed push is retried before its batch is dropped; 0 = until
+  # it succeeds (the journal is the buffer). Alloy's own default is 10.
+  loki_max_retries: "int(0,)"
   # Optional metrics scrape (Home Assistant's /api/prometheus by default),
   # remote-written to a Prometheus. Nothing is read unless metrics_enabled.
   metrics_enabled: bool
+  # Alloy's own metrics (job "alloy") through the same remote write.
+  self_metrics: bool
   metrics_url: "str?"
   metrics_token: "password?"
   metrics_remote_write_url: "str?"

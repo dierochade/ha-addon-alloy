@@ -14,6 +14,7 @@ The defaults ship the journal **as journald recorded it**: job `systemd-journal`
 | `loki_username` / `loki_password` | *(empty)* | Basic auth for the push, as Grafana Cloud and most reverse proxies require. The password is kept in a 0600 file, never in the generated config |
 | `loki_bearer_token` | *(empty)* | Sent as `Authorization: Bearer …` instead, for a token-checking proxy. Set this **or** a username, not both - the add-on refuses both |
 | `loki_tenant_id` | *(empty)* | Sent as `X-Scope-OrgID`, for a multi-tenant Grafana Loki. Not needed for Grafana Cloud or a single-tenant Loki |
+| `loki_max_retries` | `0` | How often a failed push is retried before its batch is dropped. `0` = until it succeeds (Grafana Alloy's own default is 10, about 8.5 to 13.5 minutes). The journal keeps every line until it is read, so while a push retries Grafana Alloy stops reading, and a Grafana Loki outage only delays the lines. See **Health and restarts** |
 | `log_level` | `info` | Grafana Alloy's own verbosity (`debug`, `info`, `warn`, `error`) |
 | `job` | `systemd-journal` | The `job` label on every stream. Set it if this instance should be told apart from other journals in the same Grafana Loki |
 | `stream_labels` | `hostname`, `unit`, `level` | Which journal fields become **stream labels**. Also available: `syslog_identifier`, `container_name`, `transport`, `priority`. Every added label multiplies streams in your Grafana Loki - add deliberately |
@@ -41,6 +42,7 @@ Off by default. When on, the add-on scrapes one OpenMetrics endpoint - by defaul
 | Option | Default | What it does |
 |---|---|---|
 | `metrics_enabled` | `false` | Turn the scrape on |
+| `self_metrics` | `false` | Also send Grafana Alloy's own metrics, as job `alloy`: build info and, per component, `loki_write_sent_entries_total`, `loki_write_dropped_entries_total`, `loki_write_batch_retries_total` - what tells a pipeline that ships from one that only runs. Needs `metrics_remote_write_url`; uses `metrics_interval` and `metrics_instance` |
 | `metrics_url` | `http://homeassistant:8123/api/prometheus` | What to scrape. The default is Home Assistant Core as seen from the add-on network; it only answers if `prometheus:` is in your `configuration.yaml` ([docs](https://www.home-assistant.io/integrations/prometheus/)) |
 | `metrics_token` | *(empty)* | Bearer token for the scrape. For Home Assistant: a **long-lived access token of a dedicated user** (see below). Stored in a 0600 file inside the add-on, never in the generated config |
 | `metrics_remote_write_url` | *(required when enabled)* | Where to send the metrics, e.g. `http://192.168.1.45:9090/api/v1/write` (Prometheus needs `--web.enable-remote-write-receiver`), or a hosted endpoint |
@@ -58,8 +60,9 @@ Grafana Alloy's debug UI (component health, pipeline graph) listens on port 1234
 ## Health and restarts
 
 - The image's health check asks Grafana Alloy's `/-/ready` every 30 s. Home Assistant restarts an add-on that turns unhealthy **only when Watchdog is on** (the add-on's Info tab). Watchdog is off by default; turn it on.
-- A crash of Grafana Alloy is restarted inside the add-on by its service supervisor, at least one second apart.
-- Neither notices a Grafana Loki that is down or rejects everything, nor a pipeline that ships nothing. Alert on the receiving side when the stream goes silent: `absent_over_time({job="systemd-journal"}[30m])`, with your own `job` and host label. `count_over_time(...) == 0` does not work for this: a silent stream returns no series at all, so the comparison never fires.
+- A crash of Grafana Alloy is restarted inside the add-on, at least one second apart. A crash *series* - three within 60 s, typically a configuration that parses but cannot start, such as a bad `additional_config` - stops the add-on instead, with the reason in its log. Home Assistant then shows it as stopped, and Watchdog (when on) restarts it a limited number of times.
+- A Grafana Loki outage delays lines instead of losing them (`loki_max_retries: 0`): the journal is the buffer. What is in memory - up to about 11 MiB, one batch plus Grafana Alloy's queue - is lost if the add-on restarts during the outage. After Grafana Loki returns, the next attempt can take up to 5 minutes (the longest backoff). With a value above 0, a batch is dropped once its retries are used up; `self_metrics` counts those in `loki_write_dropped_entries_total`.
+- None of this notices a Grafana Loki that rejects everything (a 4xx answer drops the batch at once), nor a pipeline that ships nothing. Alert on the receiving side when the stream goes silent: `absent_over_time({job="systemd-journal"}[30m])`, with your own `job` and host label. `count_over_time(...) == 0` does not work for this: a silent stream returns no series at all, so the comparison never fires.
 
 ## Expert: raw configuration mode
 

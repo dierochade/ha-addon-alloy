@@ -27,6 +27,13 @@ configuration:
     description: >-
       Sent as the X-Scope-OrgID header, for a multi-tenant Loki. Leave empty
       for a single-tenant Loki and for Grafana Cloud.
+  loki_max_retries:
+    name: Grafana Loki push retries
+    description: >-
+      How often a failed push is retried before its lines are dropped. 0
+      (default) retries until it succeeds: the journal keeps every line, so a
+      Loki outage only delays them. Grafana Alloy's own default is 10, about
+      8.5 to 13.5 minutes.
   log_level:
     name: Grafana Alloy log level
     description: >-
@@ -85,6 +92,11 @@ configuration:
     description: >-
       Also scrape one metrics endpoint - by default Home Assistant's own
       /api/prometheus - and send it to a Prometheus. Needs a remote write URL.
+  self_metrics:
+    name: Grafana Alloy's own metrics
+    description: >-
+      Also send Grafana Alloy's own metrics (job "alloy"), among them the
+      counters of lines sent to and dropped by Loki. Needs a remote write URL.
   metrics_url:
     name: Metrics URL
     description: >-

@@ -80,11 +80,23 @@ configuration:
       homeassistant-vm, in place of the hostname label - for a Grafana Loki
       whose other sources already name machines with host. Empty keeps
       hostname (if chosen in stream labels).
+  loki_max_retries:
+    name: Grafana Loki push retries
+    description: >-
+      How often a failed push is retried before its lines are dropped. 0
+      (default) retries until it succeeds: the journal keeps every line, so a
+      Loki outage only delays them. Grafana Alloy's own default is 10, about
+      8.5 to 13.5 minutes.
   metrics_enabled:
     name: Scrape metrics
     description: >-
       Also scrape one metrics endpoint - by default Home Assistant's own
       /api/prometheus - and send it to a Prometheus. Needs a remote write URL.
+  self_metrics:
+    name: Grafana Alloy's own metrics
+    description: >-
+      Also send Grafana Alloy's own metrics (job "alloy"), among them the
+      counters of lines sent to and dropped by Loki. Needs a remote write URL.
   metrics_url:
     name: Metrics URL
     description: >-

@@ -16,6 +16,22 @@ goes directly under the marker below, which Renovate needs to find its
 heading.
 
 <!-- renovate:alloy-release -->
+## 1.22.0.2
+
+- New option `loki_max_retries`, default `0`: a failed push is retried
+  until it succeeds. Grafana Alloy's own default (10 retries, about 8.5
+  to 13.5 minutes) dropped every line of a longer Grafana Loki outage.
+  The journal keeps the lines while the push waits, so an outage now
+  delays them. Set a number to get the old behaviour back.
+- A crash series stops the add-on: three Grafana Alloy crashes within
+  60 s (a configuration that parses but cannot start, for example) no
+  longer loop for ever inside a container that shows as started. A
+  single crash is still restarted in place. With Watchdog on, Home
+  Assistant restarts the stopped add-on.
+- New option `self_metrics`: Grafana Alloy's own metrics, as job
+  `alloy`, through the metrics remote write - among them the counters
+  of lines sent to and dropped by Grafana Loki.
+
 ## 1.22.0.1
 
 - `level_from_message` reads the level from the head of the line (its
