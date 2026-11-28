@@ -25,6 +25,8 @@ jobs:
     steps:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Find app directories
         id: addons
@@ -40,8 +42,31 @@ jobs:
     steps:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Run Home Assistant App Lint
         uses: frenck/action-addon-linter@b9cfd1bc62ba60d2c4fc96317b5f7ada5923f4a7 # v2.21
         with:
           path: "./${{ matrix.path }}"
+
+  # The generator and the s6 scripts run on every host; the e2e harness gates
+  # every release. The s6 scripts start with `#!/usr/bin/with-contenv bash`,
+  # a shebang shellcheck does not know, so they are checked as bash; the
+  # execline `up` files are not shell and carry no such shebang.
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run shellcheck
+        run: |
+          command -v shellcheck >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
+          shellcheck --version
+          mapfile -t s6 < <(grep -rlE '^#!.*with-contenv bash' -- */rootfs)
+          shellcheck --shell=bash "${s6[@]}"
+          shellcheck .github/scripts/*.sh

@@ -83,6 +83,17 @@
       "depNameTemplate": "ghcr.io/sporqist/ha-addon-alloy",
       "datasourceTemplate": "docker",
       "versioningTemplate": "loose"
+    },
+    {
+      "customType": "regex",
+      "description": "Images the CI scripts run, pinned by a '# renovate: datasource=<ds> depName=<name> [versioning=<v>]' comment directly above their NAME=\"<tag>\" line (PROM_TAG in e2e.sh). Without a manager the comment does nothing.",
+      "managerFilePatterns": [
+        "/^\\.github/scripts/.+\\.sh$/"
+      ],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)(?: versioning=(?<versioning>\\S+))?\\n[A-Z_]+=\"(?<currentValue>[^\"]+)\""
+      ],
+      "versioningTemplate": "{{#if versioning}}{{{versioning}}}{{else}}docker{{/if}}"
     }
   ],
   "packageRules": [
