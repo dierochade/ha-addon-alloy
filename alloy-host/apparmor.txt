@@ -129,6 +129,17 @@ profile alloy-host flags=(attach_disconnected,mediate_deleted) {
     /dev/null rw,
     /tmp/** rwk,
 
+    # Alloy's own resource collector (gopsutil, always registered) runs each
+    # time Alloy's metrics are scraped: self_metrics, or anything scraping
+    # :12345/metrics. Its one-off container probe reads /proc/modules and PID
+    # 1's environment (a ptrace read of the outer profile); it ignores both
+    # errors and finds "docker guest" through /.dockerenv anyway, so they are
+    # denied quietly - PID 1's environment is no business of Alloy's.
+    # (/proc/uptime, which it reads on every scrape, is allowed below with
+    # the host collectors.)
+    deny /proc/modules r,
+    deny ptrace (read) peer=*_alloy-host,
+
     # prometheus.exporter.unix, the host variant's reason to exist. /proc is
     # this container's own view plus the kernel-global files (host_pid does not
     # work with s6, so no other host's processes are visible). /sys reads are

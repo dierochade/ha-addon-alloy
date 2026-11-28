@@ -128,5 +128,17 @@ profile alloy flags=(attach_disconnected,mediate_deleted) {
     owner /proc/*/** r,
     /dev/null rw,
     /tmp/** rwk,
+
+    # Alloy's own resource collector (gopsutil, always registered) runs each
+    # time Alloy's metrics are scraped: self_metrics, or anything scraping
+    # :12345/metrics. Its one-off container probe reads /proc/modules and PID
+    # 1's environment (a ptrace read of the outer profile); it ignores both
+    # errors and finds "docker guest" through /.dockerenv anyway, so they are
+    # denied quietly - PID 1's environment is no business of Alloy's.
+    # In a container it then takes the boot time from /proc/uptime, on every
+    # scrape (alloy_resources_process_start_time_seconds).
+    /proc/uptime r,
+    deny /proc/modules r,
+    deny ptrace (read) peer=*_alloy,
   }
 }

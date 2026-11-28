@@ -30,7 +30,10 @@ heading.
   Assistant restarts the stopped add-on.
 - New option `self_metrics`: Grafana Alloy's own metrics, as job
   `alloy`, through the metrics remote write - among them the counters
-  of lines sent to and dropped by Grafana Loki.
+  of lines sent to and dropped by Grafana Loki. The AppArmor profile
+  allows the `/proc/uptime` read Grafana Alloy's resource metrics need
+  when anything scrapes them, and quietly denies the module list and
+  PID 1's environment, which only its container probe reads.
 
 ## 1.22.0.1
 
