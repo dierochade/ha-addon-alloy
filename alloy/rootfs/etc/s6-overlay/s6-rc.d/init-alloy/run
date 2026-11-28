@@ -59,6 +59,20 @@ if [ -n "${MULTILINE_CONTAINERS}" ]; then
         echo "!! multiline_containers may only hold a regex of container names (letters, digits, _ . - and | * + ? ^ \$ ( ) [ ]), not '${MULTILINE_CONTAINERS}'"
         exit 1
     fi
+    # The allowlist keeps the quoting safe; it does not make a valid regex.
+    # Compile it here (jq's Oniguruma), so "x|y)" or "*x" stops the add-on with
+    # the reason instead of failing inside Alloy at start, after `alloy
+    # validate` passed. Stacked quantifiers are refused by name: Oniguruma
+    # reads "a++" as possessive and "a**" as a nested repeat, and Go's RE2,
+    # which Alloy compiles the selector with, rejects both.
+    if ! ml_err=$(jq -n --arg re "${MULTILINE_CONTAINERS}" '"" | test($re)' 2>&1 >/dev/null); then
+        echo "!! multiline_containers is not a valid regex: '${MULTILINE_CONTAINERS}' (${ml_err##*: })"
+        exit 1
+    fi
+    if [[ "${MULTILINE_CONTAINERS}" =~ [*+?][*+] ]]; then
+        echo "!! multiline_containers has a stacked quantifier (such as ** or ++), which Grafana Alloy's regex engine refuses: '${MULTILINE_CONTAINERS}'"
+        exit 1
+    fi
 fi
 METRICS_ENABLED=$(opt '.metrics_enabled // false')
 ADDITIONAL_CONFIG=$(opt '.additional_config // ""')
@@ -93,7 +107,9 @@ fi
 VARIANT=$(cat /etc/alloy-addon/variant 2>/dev/null || echo base)
 HOST_METRICS=false
 if [ "${VARIANT}" = "host" ]; then
-    HOST_METRICS=$(opt '.host_metrics // true')
+    # Not `.host_metrics // true`: jq's // treats false like a missing value,
+    # so host_metrics: false would read as on.
+    HOST_METRICS=$(opt 'if .host_metrics == null then true else .host_metrics end')
 fi
 
 # finish: validate the generated file and stop the container on failure.
@@ -346,35 +362,40 @@ fi
 if [ "${LEVEL_FROM_MESSAGE}" = "true" ]; then
     # The line is the journal MESSAGE on both paths (stage.output runs right
     # after stage.json), so a level token in any other field (a command line,
-    # a tag) is never seen.
-cat >> "${CONFIG_FILE}" <<EOF
+    # a tag) is never seen. Quoted heredoc: no shell expansion, the regexes
+    # are written once-escaped for the Alloy string.
+cat >> "${CONFIG_FILE}" <<'EOF'
 
   // Docker's journald driver logs a container's stderr at priority err, so a
   // WARN or INFO line written to stderr arrives as level="error". Scoped to
   // container streams at that priority; the level is re-derived from the
-  // message (logfmt level=..., a bare LEVEL token, or a lowercase level as the
-  // line's first word, "info: ..." / "s6-rc: info: ..." / "[warn] ...") and
-  // falls back to "error".
+  // message and falls back to "error".
+  //
+  // Only the head of the line counts - its first 80 characters, where loggers
+  // put the level - and there the LEFTMOST level wins, whatever its form:
+  //   a lowercase level as the first word, optionally behind one "program: "
+  //     prefix: "info: ...", "s6-rc: info: ...", "[warn] ..."
+  //   logfmt in any case: "level=warn", "level=INFO" (Go's slog)
+  //   a bare uppercase token: "... WARNING (MainThread) ...", "[INFO]", "ERROR:"
+  //   a lowercase level in brackets: "2026/01/01 00:00:00 [warn] ..." (nginx)
+  // A line that starts with ERROR stays an error, whatever "level=debug" or
+  // "INFO" its text mentions later. "disk info: low" is not a level. A logfmt
+  // level=... beyond the head (a long ts= and caller= in front of it) is the
+  // fallback when the head has none.
   stage.match {
-    selector = "{level=\\"error\\", container_name=~\\".+\\"}"
+    selector = "{level=\"error\", container_name=~\".+\"}"
 
     stage.regex {
-      expression = "(?:^|\\\\s)level=(?P<logfmt_level>trace|debug|info|warn|warning|error|fatal|critical)(?:\\\\s|$)"
+      expression = "^(?:(?:[\\w./-]+: )?\\[?(?P<first_level>trace|debug|info|notice|warn|warning|error|fatal|critical)(?:\\]|:)(?:\\s|$)|.{0,80}?(?:(?:^|\\s)level=(?P<logfmt_level>(?i:trace|debug|info|warn|warning|error|fatal|critical))(?:\\s|$)|(?:^|[\\s\\[])(?P<bare_level>TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL|CRITICAL)(?:[\\s:\\]]|$)|\\[(?P<bracket_level>trace|debug|info|notice|warn|warning|error|fatal|crit|critical)\\]))"
     }
     stage.regex {
-      expression = "(?:^|\\\\s)(?P<bare_level>TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL|CRITICAL)(?:\\\\s|:)"
+      expression = "(?:^|\\s)level=(?P<late_level>(?i:trace|debug|info|warn|warning|error|fatal|critical))(?:\\s|$)"
     }
-    // Lowercase only where it can only be a level: first word of the line,
-    // optionally behind one "program: " prefix (s6-overlay, bashio), as
-    // "level:" or "[level]". "disk info: low" stays untouched.
-    stage.regex {
-      expression = "^(?:[\\\\w./-]+: )?\\\\[?(?P<prefix_level>trace|debug|info|notice|warn|warning|error|fatal|critical)(?:\\\\]|:)(?:\\\\s|$)"
-    }
-EOF
-cat >> "${CONFIG_FILE}" <<'EOF'
+    // One alternative of the head regex matches, so at most one of its groups
+    // is set; coalesce skips the empty ones and the missing late_level.
     stage.template {
       source   = "derived_level"
-      template = "{{ if .logfmt_level }}{{ if eq .logfmt_level \"warn\" }}warning{{ else if eq .logfmt_level \"critical\" }}crit{{ else }}{{ .logfmt_level }}{{ end }}{{ else if .bare_level }}{{ if eq .bare_level \"TRACE\" }}trace{{ else if eq .bare_level \"DEBUG\" }}debug{{ else if eq .bare_level \"INFO\" }}info{{ else if eq .bare_level \"WARN\" }}warning{{ else if eq .bare_level \"WARNING\" }}warning{{ else if eq .bare_level \"ERROR\" }}error{{ else if eq .bare_level \"FATAL\" }}fatal{{ else if eq .bare_level \"CRITICAL\" }}crit{{ else }}error{{ end }}{{ else if .prefix_level }}{{ if eq .prefix_level \"warn\" }}warning{{ else if eq .prefix_level \"critical\" }}crit{{ else }}{{ .prefix_level }}{{ end }}{{ else }}error{{ end }}"
+      template = "{{ $l := ToLower (coalesce .first_level .logfmt_level .bare_level .bracket_level .late_level \"error\") }}{{ if eq $l \"warn\" }}warning{{ else if eq $l \"critical\" }}crit{{ else }}{{ $l }}{{ end }}"
     }
     stage.labels {
       values = {

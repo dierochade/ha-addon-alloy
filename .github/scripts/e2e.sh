@@ -14,10 +14,12 @@
 #   3. with OPINIONATED options (custom job, more labels, structured metadata,
 #      level_from_message): the config validates under the profile and the line
 #      arrives under the custom job with the extra labels present
-#   5-6. metrics (and host metrics for alloy-host) reach a real Prometheus
+#   5-6. metrics (and host metrics for alloy-host) reach a real Prometheus;
+#      host_metrics: false renders no exporter
 #   7. basic auth, a bearer token and a tenant reach a Loki that checks them
-#   8. a localhost loki_url and contradictory credentials are refused with a
-#      reason; a job with quotes and backslashes ships as that exact label
+#   8. a localhost loki_url, contradictory credentials and an invalid
+#      multiline_containers regex are refused with a reason; a job with
+#      quotes and backslashes ships as that exact label
 #   9. host_label: the line carries a static host label and no hostname
 #  10. strip_ansi: colour codes are gone from the stored line, and the level
 #      token behind one is still found
@@ -350,6 +352,12 @@ if [ -z "$LOCAL" ]; then
   probe_level info    "s6-rc: info: service e2e successfully started"
   probe_level warning "[warn] bracketed lowercase"
   probe_level error   "disk info: not a level token"
+  # The leftmost level in the head of the line wins; logfmt in any case;
+  # nginx's bracketed lowercase; a logfmt level beyond the head as fallback.
+  probe_level error   "ERROR job failed; retry with level=debug"
+  probe_level info    "time=2026-01-01T00:00:00.000+01:00 level=INFO msg=slog form"
+  probe_level warning "2026/01/01 00:00:00 [warn] 12#12: nginx form"
+  probe_level warning "ts=2026-01-01T00:00:00.123456789Z caller=internal/component/some/long/path/to/file.go:123 component=e2e level=warn msg=late"
 fi
 
 say "3b. level_from_message on the plain (non-JSON) path"
@@ -362,6 +370,12 @@ if [ -z "$LOCAL" ]; then
   probe_level info    "s6-rc: info: service e2e successfully started"
   probe_level warning "[warn] bracketed lowercase"
   probe_level error   "disk info: not a level token"
+  # The leftmost level in the head of the line wins; logfmt in any case;
+  # nginx's bracketed lowercase; a logfmt level beyond the head as fallback.
+  probe_level error   "ERROR job failed; retry with level=debug"
+  probe_level info    "time=2026-01-01T00:00:00.000+01:00 level=INFO msg=slog form"
+  probe_level warning "2026/01/01 00:00:00 [warn] 12#12: nginx form"
+  probe_level warning "ts=2026-01-01T00:00:00.123456789Z caller=internal/component/some/long/path/to/file.go:123 component=e2e level=warn msg=late"
   CUR_JOB="systemd-journal"
 else
   echo "skipped (E2E_LOCAL: needs the host journal)"
@@ -445,6 +459,10 @@ if [ "$SLUG" = "alloy-host" ]; then
   done
   [ -n "$found" ] || fail "node_cpu_seconds_total / node_memory_MemTotal_bytes never arrived in Prometheus under job=node"
   echo "unix exporter -> remote_write -> Prometheus: cpu series present, MemTotal > 0"
+  # jq's // reads false like a missing value; the generator must not.
+  start_addon "{\"loki_url\":\"$LOKI_PUSH\",\"log_level\":\"info\",\"host_metrics\":false}"
+  [ "$(docker exec "$NAME" grep -c 'prometheus.exporter.unix' /etc/alloy/config.alloy)" = "0" ] || fail "host_metrics: false still renders the unix exporter"
+  echo "host_metrics: false renders no exporter"
 fi
 
 say "7. Loki authentication: basic auth, bearer token, tenant"
@@ -473,6 +491,9 @@ fi
 say "8. Options that must be refused, and values that must be escaped"
 expect_refusal "{\"loki_url\":\"http://localhost:3100/loki/api/v1/push\"}" "is the add-on itself"
 expect_refusal "{\"loki_url\":\"$LOKI_PUSH\",\"loki_username\":\"u\",\"loki_bearer_token\":\"t\"}" "one or the other"
+# Regexes `alloy validate` would pass and Alloy would then fail to build.
+expect_refusal "{\"loki_url\":\"$LOKI_PUSH\",\"multiline_containers\":\"x|y)\"}" "not a valid regex"
+expect_refusal "{\"loki_url\":\"$LOKI_PUSH\",\"multiline_containers\":\"a++\"}" "stacked quantifier"
 # A job with a quote and a backslash is a label value like any other, not
 # the end of an Alloy string.
 QJOB='e2e "quoted" \ job'

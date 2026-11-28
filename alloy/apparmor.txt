@@ -85,7 +85,7 @@ profile alloy flags=(attach_disconnected,mediate_deleted) {
     # Receive signals from S6-Overlay
     signal (receive) peer=*_alloy,
 
-    # Push to Loki, serve /-/ready to the Supervisor's watchdog
+    # Push to Loki; serve /-/ready to the HEALTHCHECK's curl and the debug UI
     network inet stream,
     network inet6 stream,
     network inet dgram,

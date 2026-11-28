@@ -56,8 +56,9 @@ configuration:
     description: >-
       Docker logs a container's stderr at priority "err", so an add-on's own
       WARN or INFO lines arrive as level=error. When on, container lines at
-      that priority get their level from the message text (level=... or a
-      bare WARN/INFO/... token, or a lowercase level as the line's first word such as "info: ..."). Off keeps the journal's own priority.
+      that priority get their level from the start of the message text: the
+      leftmost of level=..., a bare WARN/INFO/... token, or a lowercase level
+      such as "info: ..." or "[warn]". Off keeps the journal's own priority.
   strip_ansi:
     name: Strip ANSI colour codes
     description: >-

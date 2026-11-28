@@ -16,6 +16,26 @@ goes directly under the marker below, which Renovate needs to find its
 heading.
 
 <!-- renovate:alloy-release -->
+## 1.22.0.1
+
+- `level_from_message` reads the level from the head of the line (its
+  first 80 characters) and takes the leftmost one there. A line that
+  starts with `ERROR` stays an error even if `level=debug` or `INFO`
+  appears later in it. New forms: logfmt in any case (`level=INFO`, as
+  Go's slog writes it) and a lowercase level in brackets after a
+  timestamp (`[warn]`, as nginx writes it). A logfmt `level=` beyond the
+  head is the fallback.
+- `multiline_containers` is compiled before Grafana Alloy starts: an
+  invalid regex (`x|y)`, a stacked quantifier) stops the add-on with the
+  reason instead of failing inside Grafana Alloy at start.
+- `host_metrics: false` (alloy-host) turns host metrics off. It was read
+  as on: jq's `//` treats `false` like a missing value.
+- Docs: a "Health and restarts" section (Home Assistant restarts an
+  unhealthy add-on only with Watchdog on, which is off by default), a
+  silence alert that fires (`absent_over_time`), and the journal history
+  read on first start (7 h, not all of it). Comments that called the
+  `watchdog:` key obsolete are corrected.
+
 ## 1.22.0
 
 Grafana Alloy 1.22.0; the add-on itself is unchanged.
