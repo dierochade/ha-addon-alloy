@@ -1,0 +1,49 @@
+#!/usr/bin/with-contenv bash
+# s6-supervise runs this every time Alloy exits: $1 is the exit code, or 256
+# when a signal killed it, and then $2 is the signal. s6 restarts Alloy after
+# it, at least one second apart, for as long as the container runs.
+#
+# That heals a single crash. A persistent one - a config that passes `alloy
+# validate` and then fails to build at start, for example - becomes an endless
+# loop inside a container that still shows as started, every round writing
+# its error to the journal. So a crash SERIES stops the container: Home
+# Assistant shows the app as stopped, and its Watchdog, when on, restarts it,
+# rate-limited by the Supervisor, so that loop ends too.
+#
+# Must finish within 5 s (s6-supervise kills it after that).
+LIMIT=3
+WINDOW=60
+STATE=/run/alloy-addon/crashes
+
+code="${1:-0}" sig="${2:-0}"
+# A clean exit, or the TERM/INT of a container stop, is not a crash.
+if [ "${code}" -eq 0 ]; then exit 0; fi
+if [ "${code}" -eq 256 ] && { [ "${sig}" -eq 15 ] || [ "${sig}" -eq 2 ]; }; then exit 0; fi
+
+if [ "${code}" -eq 256 ]; then
+    what="was killed by signal ${sig}"; exitcode=$((128 + sig))
+else
+    what="exited with code ${code}"; exitcode="${code}"
+fi
+
+# The crashes inside the window, this one included.
+now=$(date +%s)
+mkdir -p "${STATE%/*}"
+recent=()
+if [ -f "${STATE}" ]; then
+    while read -r t; do
+        [ -n "${t}" ] && [ $((now - t)) -lt "${WINDOW}" ] && recent+=("${t}")
+    done < "${STATE}"
+fi
+recent+=("${now}")
+printf '%s\n' "${recent[@]}" > "${STATE}"
+
+if [ "${#recent[@]}" -lt "${LIMIT}" ]; then
+    echo "Grafana Alloy ${what}; restarting (${#recent[@]} of ${LIMIT} crashes within ${WINDOW}s stop the add-on)"
+    exit 0
+fi
+
+echo "!! Grafana Alloy ${what}, crash ${#recent[@]} within ${WINDOW}s - stopping the add-on. The error is above."
+# The container's exit code, as s6-overlay reads it at shutdown.
+echo "${exitcode}" > /run/s6-linux-init-container-results/exitcode
+exec /run/s6/basedir/bin/halt

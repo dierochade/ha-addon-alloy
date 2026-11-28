@@ -11,14 +11,15 @@ The defaults ship the journal **as journald recorded it**: job `systemd-journal`
 | Option | Default | What it does |
 |---|---|---|
 | `loki_url` | *(required)* | Grafana Loki push endpoint, e.g. `http://192.168.1.45:3100/loki/api/v1/push`. The address of the machine Grafana Loki runs on: `localhost` is the add-on itself, so the add-on refuses it |
-| `loki_username` / `loki_password` | *(empty)* | Basic auth for the push, as Grafana Cloud and most reverse proxies require. The password is kept in a 0600 file, never in the generated config |
+| `loki_username` / `loki_password` | *(empty)* | Basic auth for the push, as Grafana Cloud and most reverse proxies require. The password is kept in a 0600 file, never in the generated config. Over an `http://` URL the add-on warns: the credentials are then readable on the network |
 | `loki_bearer_token` | *(empty)* | Sent as `Authorization: Bearer …` instead, for a token-checking proxy. Set this **or** a username, not both - the add-on refuses both |
 | `loki_tenant_id` | *(empty)* | Sent as `X-Scope-OrgID`, for a multi-tenant Grafana Loki. Not needed for Grafana Cloud or a single-tenant Loki |
+| `loki_max_retries` | `0` | How often a failed push is retried before its batch is dropped. `0` = until it succeeds (Grafana Alloy's own default is 10, about 8.5 to 13.5 minutes). The journal keeps every line until it is read, so while a push retries Grafana Alloy stops reading, and a Grafana Loki outage only delays the lines. See **Health and restarts** |
 | `log_level` | `info` | Grafana Alloy's own verbosity (`debug`, `info`, `warn`, `error`) |
 | `job` | `systemd-journal` | The `job` label on every stream. Set it if this instance should be told apart from other journals in the same Grafana Loki |
 | `stream_labels` | `hostname`, `unit`, `level` | Which journal fields become **stream labels**. Also available: `syslog_identifier`, `container_name`, `transport`, `priority`. Every added label multiplies streams in your Grafana Loki - add deliberately |
 | `structured_metadata` | `false` | Carry `syslog_identifier`, `container_name`, `transport` and `priority` as [structured metadata](https://grafana.com/docs/loki/latest/get-started/labels/structured-metadata/) on every line - queryable, but not streams. **Needs Grafana Loki 2.9+ with structured metadata enabled (schema v13)**; a Grafana Loki without it rejects the whole push, which is why this is off by default |
-| `level_from_message` | `false` | Docker's journald driver logs a container's stderr at priority `err`, so an add-on's `WARN` or `INFO` line written to stderr arrives as `level="error"`. When on, container lines at that priority get `level` re-derived from the line (logfmt `level=...`, a bare `WARN`/`INFO`/... token, or a lowercase level as the line's first word: `info: ...`, `s6-rc: info: ...`, `[warn] ...`), falling back to `error`. Off = the journal's own priority, untouched |
+| `level_from_message` | `false` | Docker's journald driver logs a container's stderr at priority `err`, so an add-on's `WARN` or `INFO` line written to stderr arrives as `level="error"`. When on, container lines at that priority get `level` re-derived from the head of the line (its first 80 characters), where the leftmost level wins: a lowercase level as the first word (`info: ...`, `s6-rc: info: ...`, `[warn] ...`), logfmt `level=...` in any case, a bare `WARN`/`INFO`/... token, or a lowercase level in brackets (`[warn]` after a timestamp). A line that starts with `ERROR` stays an error, whatever it mentions later. A logfmt `level=` further on is the fallback; without any, `error`. Off = the journal's own priority, untouched |
 | `strip_ansi` | `false` | Removes terminal colour codes (`ESC [ ... m`) from every line before anything else reads it. Home Assistant, the Supervisor and Zigbee2MQTT colour their output; the codes are garbage in Grafana and break `|=` searches. Off = the line as the journal recorded it |
 | `multiline_containers` | *(empty)* | Regex of container names (for example `homeassistant\|hassio_supervisor`) whose Python tracebacks are joined into one entry. Docker's journald driver writes every traceback line as its own entry; with this, a line that does not start with a timestamp (or Python's `--- Logging error ---`) is appended to the record before it, for up to 3 s and 128 lines. The joined entry keeps the first line's timestamp and labels, and `level_from_message` reads its level from that first line. Letters, digits and regex characters only. Empty = off |
 | `host_label` | *(empty)* | When set, every line gets a static `host` stream label with this value instead of `hostname` (which is then not set, even if chosen in `stream_labels`). For a Grafana Loki whose other sources already name the machine with `host`. Empty = `hostname` as chosen |
@@ -41,6 +42,7 @@ Off by default. When on, the add-on scrapes one OpenMetrics endpoint - by defaul
 | Option | Default | What it does |
 |---|---|---|
 | `metrics_enabled` | `false` | Turn the scrape on |
+| `self_metrics` | `false` | Also send Grafana Alloy's own metrics, as job `alloy`: build info and, per component, `loki_write_sent_entries_total`, `loki_write_dropped_entries_total`, `loki_write_batch_retries_total` - what tells a pipeline that ships from one that only runs. Needs `metrics_remote_write_url`; uses `metrics_interval` and `metrics_instance` |
 | `metrics_url` | `http://homeassistant:8123/api/prometheus` | What to scrape. The default is Home Assistant Core as seen from the add-on network; it only answers if `prometheus:` is in your `configuration.yaml` ([docs](https://www.home-assistant.io/integrations/prometheus/)) |
 | `metrics_token` | *(empty)* | Bearer token for the scrape. For Home Assistant: a **long-lived access token of a dedicated user** (see below). Stored in a 0600 file inside the add-on, never in the generated config |
 | `metrics_remote_write_url` | *(required when enabled)* | Where to send the metrics, e.g. `http://192.168.1.45:9090/api/v1/write` (Prometheus needs `--web.enable-remote-write-receiver`), or a hosted endpoint |
@@ -53,7 +55,14 @@ Off by default. When on, the add-on scrapes one OpenMetrics endpoint - by defaul
 
 ## Debug UI
 
-Grafana Alloy's debug UI (component health, pipeline graph) listens on port 12345 inside the add-on but is **not published on the host by default**, because it has no authentication. To use it temporarily, set a host port for `12345/tcp` in the add-on's Network settings, and clear it again afterwards. The Supervisor's watchdog reaches `/-/ready` on the add-on network regardless of the mapping.
+Grafana Alloy's debug UI (component health, pipeline graph) listens on port 12345 inside the add-on but is **not published on the host by default**, because it has no authentication. Its profiling endpoints (`/debug/pprof`) are switched off. To use it temporarily, set a host port for `12345/tcp` in the add-on's Network settings, and clear it again afterwards. The health check does not need the mapping: Docker runs it inside the add-on.
+
+## Health and restarts
+
+- The image's health check asks Grafana Alloy's `/-/ready` every 30 s. Home Assistant restarts an add-on that turns unhealthy **only when Watchdog is on** (the add-on's Info tab). Watchdog is off by default; turn it on.
+- A crash of Grafana Alloy is restarted inside the add-on, at least one second apart. A crash *series* - three within 60 s, typically a configuration that parses but cannot start, such as a bad `additional_config` - stops the add-on instead, with the reason in its log. Home Assistant then shows it as stopped, and Watchdog (when on) restarts it a limited number of times.
+- A Grafana Loki outage delays lines instead of losing them (`loki_max_retries: 0`): the journal is the buffer. What is in memory - up to about 11 MiB, one batch plus Grafana Alloy's queue - is lost if the add-on restarts during the outage. After Grafana Loki returns, the next attempt can take up to 5 minutes (the longest backoff). With a value above 0, a batch is dropped once its retries are used up; `self_metrics` counts those in `loki_write_dropped_entries_total`.
+- None of this notices a Grafana Loki that rejects everything (a 4xx answer drops the batch at once), nor a pipeline that ships nothing. Alert on the receiving side when the stream goes silent: `absent_over_time({job="systemd-journal"}[30m])`, with your own `job` and host label. `count_over_time(...) == 0` does not work for this: a silent stream returns no series at all, so the comparison never fires.
 
 ## Expert: raw configuration mode
 
@@ -78,7 +87,7 @@ Note: This is injected as-is into the config file. Syntax errors will prevent Gr
 
 - **No logs in Grafana Loki**: Check that `loki_url` is reachable from HAOS. Try `ping <loki-host>` from the SSH add-on. A `401` or `403` in the add-on log means the credentials are missing or wrong.
 - **Add-on crashes on start**: Check the add-on log for Grafana Alloy config errors. Set `log_level: debug` for verbose output.
-- **"timestamp too old" in Grafana Loki**: Normal on first start. Grafana Alloy reads the full journal history; Grafana Loki rejects entries older than its `reject_old_samples_max_age`. Resolves in 1-2 minutes.
+- **"timestamp too old" in Grafana Loki**: Normal on first start. Grafana Alloy reads back up to 7 hours of journal (its `max_age`); Grafana Loki rejects entries older than its `reject_old_samples_max_age`. Resolves in 1-2 minutes.
 - **AppArmor**: the Grafana Alloy process runs under a custom profile. Denials show on the HA OS host as `journalctl _TRANSPORT="audit"` lines with `apparmor="DENIED"` (or `"ALLOWED"` while the profile is in complain mode). Report them with the line quoted; they are the input for tightening the profile.
 
 ## Unattended updates - what this posture is, and what it is not for
@@ -89,7 +98,7 @@ This add-on updates itself: Renovate proposes each Grafana Alloy release and eac
 
 That is acceptable **because the blast radius is bounded**: a bad update stops log shipping from one host. It does not touch Home Assistant Core, the Supervisor, or anything the house depends on. **Do not copy this posture onto an add-on that automations, heating, locks or lights depend on.**
 
-What CI cannot reproduce is your host. So pair auto-update with an alert on the receiving side that fires when the journal stream goes silent (`count_over_time({job="ha-journal", instance="..."}[30m]) == 0`). Home Assistant does **not** roll back an unhealthy add-on; it sits there until something notices.
+What CI cannot reproduce is your host. So pair auto-update with an alert on the receiving side that fires when the journal stream goes silent (`absent_over_time({job="systemd-journal"}[30m])`, see **Health and restarts**). Home Assistant does **not** roll back an unhealthy add-on; it sits there until something notices.
 
 **When an Grafana Alloy bump stalls.** Some releases touch new files or need new syscalls. The gate then fails with `apparmor="DENIED"` lines naming the path, Renovate keeps the PR open and red, and nothing ships. That reads as "the profile needs a path", not "something broke": add the access to `apparmor.txt` in a PR of its own (as narrowly as the denial allows), merge it, and Renovate rebases and retries the bump on its own. Grafana Alloy 1.19 was the first case: its bundled Snowflake driver maps a library it extracts to `/tmp`, and its usage reporter reads the DMI UUID (reporting is off here).
 
