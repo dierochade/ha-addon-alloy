@@ -471,6 +471,9 @@ say "4. Zero AppArmor denials for the profile"
 if [ -n "$LOCAL" ]; then
   echo "skipped (E2E_LOCAL)"
 else
+  # Not `aa_events | grep -q`: under pipefail a match that ends grep early
+  # sends the producer SIGPIPE, the pipeline fails, and the denial is missed.
+  # shellcheck disable=SC2143
   if [ -n "$(aa_events | grep -E 'DENIED|ALLOWED')" ]; then
     fail "the profile denied (or would have denied) something - add it to apparmor.txt"
   fi

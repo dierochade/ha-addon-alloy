@@ -22,6 +22,10 @@ jobs:
   prepare:
     name: Prepare
     runs-on: ubuntu-latest
+    # Reads the repository and asks the registry anonymously; without this the
+    # job would inherit the caller's packages: write and id-token: write.
+    permissions:
+      contents: read
     outputs:
       architectures: ${{ steps.info.outputs.architectures }}
       build_matrix: ${{ steps.matrix.outputs.matrix }}
@@ -35,6 +39,8 @@ jobs:
     steps:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Get app information
         id: info
@@ -42,20 +48,27 @@ jobs:
         with:
           path: "./${{ inputs.app }}"
 
+      # The info action emits every value JSON-encoded (yq -o=json). Decode it
+      # with jq from the environment instead of pasting ${{ }} into the
+      # script, where a $(...) or a backtick in config.yaml would run.
       - name: Normalize app information
         id: normalize
+        env:
+          INFO_IMAGE: ${{ steps.info.outputs.image }}
+          INFO_VERSION: ${{ steps.info.outputs.version }}
+          INFO_NAME: ${{ steps.info.outputs.name }}
+          INFO_DESCRIPTION: ${{ steps.info.outputs.description }}
+          INFO_URL: ${{ steps.info.outputs.url }}
         run: |
-          image=${{ steps.info.outputs.image }}
+          dec() { jq -r 'if . == null then "" else tostring end' <<< "$1"; }
+          image=$(dec "$INFO_IMAGE")
           echo "image_name=${image##*/}" >> "$GITHUB_OUTPUT"
           echo "registry_prefix=${image%/*}" >> "$GITHUB_OUTPUT"
-          version=${{ steps.info.outputs.version }}
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
-          name=${{ steps.info.outputs.name }}
-          echo "name=${name}" >> "$GITHUB_OUTPUT"
-          description=${{ steps.info.outputs.description }}
-          echo "description=${description}" >> "$GITHUB_OUTPUT"
-          url=${{ steps.info.outputs.url }}
-          if [[ -n "$url" && "$url" != "null" ]]; then
+          echo "version=$(dec "$INFO_VERSION")" >> "$GITHUB_OUTPUT"
+          echo "name=$(dec "$INFO_NAME")" >> "$GITHUB_OUTPUT"
+          echo "description=$(dec "$INFO_DESCRIPTION")" >> "$GITHUB_OUTPUT"
+          url=$(dec "$INFO_URL")
+          if [[ -n "$url" ]]; then
             echo "url=${url}" >> "$GITHUB_OUTPUT"
           fi
 
@@ -153,12 +166,14 @@ jobs:
       # The publish job builds the variant from its Dockerfile as committed,
       # i.e. from the pinned published base; the bump PR re-gates that.
       - name: Build the amd64 image on the runner
+        env:
+          APP: ${{ inputs.app }}
         run: |
-          if [[ "${{ inputs.app }}" != "alloy" && -d alloy ]]; then
+          if [[ "$APP" != "alloy" && -d alloy ]]; then
             docker buildx build --load -t base-under-test ./alloy
-            docker buildx build --load --build-arg BASE_IMAGE=base-under-test -t addon-under-test "./${{ inputs.app }}"
+            docker buildx build --load --build-arg BASE_IMAGE=base-under-test -t addon-under-test "./$APP"
           else
-            docker buildx build --load -t addon-under-test "./${{ inputs.app }}"
+            docker buildx build --load -t addon-under-test "./$APP"
           fi
 
       - name: Wait for Loki
@@ -170,9 +185,11 @@ jobs:
           echo "Loki never became ready"; exit 1
 
       - name: Run the end-to-end test
+        env:
+          APP: ${{ inputs.app }}
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq apparmor-utils python3-systemd >/dev/null
-          APP="${{ inputs.app }}" bash .github/scripts/e2e.sh addon-under-test \
+          bash .github/scripts/e2e.sh addon-under-test \
             http://host.docker.internal:3100/loki/api/v1/push \
             http://localhost:3100
 

@@ -30,6 +30,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       # Published tags never change (build-app skips one that exists), so a
       # change to what a host installs without a new version would reach
@@ -41,9 +42,25 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: python3 .github/scripts/version.py check --base "$BASE_SHA"
 
+      # Plain git, not a third-party action: tj-actions/changed-files was
+      # compromised in March 2025 (CVE-2025-30066), and the list is one diff.
+      # Same output as before: the changed paths, space-separated.
       - name: Get changed files
         id: changed_files
-        uses: tj-actions/changed-files@24d32ffd492484c1d75e0c0b894501ddb9d30d62 # v47
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          if [[ "$EVENT" == "pull_request" ]]; then base="$PR_BASE"; else base="$PUSH_BEFORE"; fi
+          # A new branch (before = 000...) or a base that is not in the clone
+          # (a force-push): count every file as changed.
+          if [[ -z "$base" || "$base" =~ ^0+$ ]] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            files=$(git ls-files)
+          else
+            files=$(git diff --name-only "$base" HEAD)
+          fi
+          echo "all_changed_files=$(printf '%s' "$files" | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
 
       - name: Find app directories
         id: apps
