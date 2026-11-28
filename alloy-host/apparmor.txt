@@ -19,6 +19,14 @@ profile alloy-host flags=(attach_disconnected,mediate_deleted) {
   # whole e2e, every option path included, and the gate keeps it honest.
   signal (send) set=(kill,term,int,hup,cont),
 
+  # Docker stops the container through runc. Where runc runs under an AppArmor
+  # profile of its own (AppArmor 4 hosts such as the Ubuntu 24.04 runner), its
+  # SIGTERM/SIGKILL arrive from peer "runc" and are denied without this rule;
+  # Docker's own default profile carries the same rule (moby/moby#47749).
+  # AppArmor 3.1.7, which Home Assistant OS ships, has no runc profile, so
+  # there runc is unconfined and the rule is never used.
+  signal (receive) peer=runc,
+
   # S6-Overlay (v3 layout: s6-rc.d under /etc/s6-overlay). Its stages are
   # scripts, so they are read as well as executed.
   /init rix,
@@ -120,6 +128,17 @@ profile alloy-host flags=(attach_disconnected,mediate_deleted) {
     owner /proc/*/** r,
     /dev/null rw,
     /tmp/** rwk,
+
+    # Alloy's own resource collector (gopsutil, always registered) runs each
+    # time Alloy's metrics are scraped: self_metrics, or anything scraping
+    # :12345/metrics. Its one-off container probe reads /proc/modules and PID
+    # 1's environment (a ptrace read of the outer profile); it ignores both
+    # errors and finds "docker guest" through /.dockerenv anyway, so they are
+    # denied quietly - PID 1's environment is no business of Alloy's.
+    # (/proc/uptime, which it reads on every scrape, is allowed below with
+    # the host collectors.)
+    deny /proc/modules r,
+    deny ptrace (read) peer=*_alloy-host,
 
     # prometheus.exporter.unix, the host variant's reason to exist. /proc is
     # this container's own view plus the kernel-global files (host_pid does not

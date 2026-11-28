@@ -44,7 +44,10 @@ options:
     - level
   structured_metadata: false
   level_from_message: false
+  strip_ansi: false
+  loki_max_retries: 0
   metrics_enabled: false
+  self_metrics: false
   # Optional keys listed with "" so the form shows them (it hides optional
   # keys absent from options). "" is valid for str/password, not for url -
   # hence the URLs are typed str and checked by the generator.
@@ -52,6 +55,8 @@ options:
   loki_password: ""
   loki_bearer_token: ""
   loki_tenant_id: ""
+  host_label: ""
+  multiline_containers: ""
   metrics_url: ""
   metrics_token: ""
   metrics_remote_write_url: ""
@@ -73,14 +78,26 @@ schema:
     - "list(hostname|unit|level|syslog_identifier|container_name|transport|priority)"
   structured_metadata: bool
   level_from_message: bool
+  strip_ansi: bool
+  # A static `host` stream label in place of `hostname`, for a Loki whose other
+  # sources name the machine that way. Empty = hostname as chosen above.
+  host_label: "str?"
+  # A regex of container names (e.g. homeassistant|hassio_supervisor) whose
+  # Python tracebacks are joined into one entry. Empty = off.
+  multiline_containers: "str?"
   loki_username: "str?"
   loki_password: "password?"
   loki_bearer_token: "password?"
   loki_tenant_id: "str?"
+  # How often a failed push is retried before its batch is dropped; 0 = until
+  # it succeeds (the journal is the buffer). Alloy's own default is 10.
+  loki_max_retries: "int(0,)"
   metrics_enabled: bool
+  # Alloy's own metrics (job "alloy") through the same remote write.
+  self_metrics: bool
   metrics_url: "str?"
   metrics_token: "password?"
-  # Required whenever metrics_enabled or host_metrics is on.
+  # Required whenever metrics_enabled, self_metrics or host_metrics is on.
   metrics_remote_write_url: "str?"
   metrics_remote_write_user: "str?"
   metrics_remote_write_password: "password?"

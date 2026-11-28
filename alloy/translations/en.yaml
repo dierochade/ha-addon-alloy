@@ -27,6 +27,13 @@ configuration:
     description: >-
       Sent as the X-Scope-OrgID header, for a multi-tenant Loki. Leave empty
       for a single-tenant Loki and for Grafana Cloud.
+  loki_max_retries:
+    name: Grafana Loki push retries
+    description: >-
+      How often a failed push is retried before its lines are dropped. 0
+      (default) retries until it succeeds: the journal keeps every line, so a
+      Loki outage only delays them. Grafana Alloy's own default is 10, about
+      8.5 to 13.5 minutes.
   log_level:
     name: Grafana Alloy log level
     description: >-
@@ -56,13 +63,40 @@ configuration:
     description: >-
       Docker logs a container's stderr at priority "err", so an add-on's own
       WARN or INFO lines arrive as level=error. When on, container lines at
-      that priority get their level from the message text (level=... or a
-      bare WARN/INFO/... token). Off keeps the journal's own priority.
+      that priority get their level from the start of the message text: the
+      leftmost of level=..., a bare WARN/INFO/... token, or a lowercase level
+      such as "info: ..." or "[warn]". Off keeps the journal's own priority.
+  strip_ansi:
+    name: Strip ANSI colour codes
+    description: >-
+      Removes terminal colour codes (ESC [ ... m) from every line. Home
+      Assistant, the Supervisor and Zigbee2MQTT colour their logs; in Grafana
+      the codes show up as garbage and break text searches. Off keeps the
+      lines as the journal recorded them.
+  multiline_containers:
+    name: Join tracebacks (containers)
+    description: >-
+      Regex of container names whose Python tracebacks become one entry
+      instead of one per line, e.g. homeassistant|hassio_supervisor. A line
+      that does not start with a timestamp is appended to the record before
+      it (up to 3 s, 128 lines). Empty = off.
+  host_label:
+    name: Host label
+    description: >-
+      Gives every line a static host label with this value, e.g. haos or
+      homeassistant-vm, in place of the hostname label - for a Grafana Loki
+      whose other sources already name machines with host. Empty keeps
+      hostname (if chosen in stream labels).
   metrics_enabled:
     name: Scrape metrics
     description: >-
       Also scrape one metrics endpoint - by default Home Assistant's own
       /api/prometheus - and send it to a Prometheus. Needs a remote write URL.
+  self_metrics:
+    name: Grafana Alloy's own metrics
+    description: >-
+      Also send Grafana Alloy's own metrics (job "alloy"), among them the
+      counters of lines sent to and dropped by Loki. Needs a remote write URL.
   metrics_url:
     name: Metrics URL
     description: >-
