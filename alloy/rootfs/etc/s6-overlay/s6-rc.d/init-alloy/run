@@ -32,6 +32,20 @@ alloy_str() {
     local s="${1//\\/\\\\}"
     printf '%s' "${s//\"/\\\"}"
 }
+# redact <url>: the URL with a user:password@ part masked, for the log. The
+# add-on's log is in the journal, and with this add-on in Loki as well.
+redact() { printf '%s' "$1" | sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://)[^/@]*@#\1***@#'; }
+# cleartext_creds <url> <auth-kind>: warn when credentials go to an http:// URL.
+cleartext_creds() {
+    local userinfo=""
+    [[ "$1" =~ ^[A-Za-z][A-Za-z0-9+.-]*://[^/@]*@ ]] && userinfo=" (in the URL)"
+    case "$1" in
+        [Hh][Tt][Tt][Pp]://*)
+            if [ "$2" != "none" ] || [ -n "${userinfo}" ]; then
+                echo " WARNING: $(redact "$1") is http:// - the credentials${userinfo} cross the network unencrypted. Use https:// unless every hop is a network you trust."
+            fi ;;
+    esac
+}
 # duration <option> <value>: an interval Alloy and timeout_for both understand.
 duration() {
     [[ "$2" =~ ^[0-9]+[smh]$ ]] && return 0
@@ -170,8 +184,11 @@ if [ -z "${LOKI_URL}" ]; then
     exit 1
 fi
 loki_host=$(printf '%s' "${LOKI_URL}" | sed -E 's#^[A-Za-z][A-Za-z0-9+.-]*://([^/@]*@)?(\[[^]/]*\]|[^]/:]*).*#\2#')
+# A guard rail against the common mistake, not a boundary: every name and
+# literal that is this container's own loopback (RFC 6761 reserves all of
+# *.localhost), plus the unspecified addresses, which reach it as well.
 case "${loki_host,,}" in
-    localhost|localhost.|127.*|0.0.0.0|"[::1]"|"[::]")
+    localhost|localhost.|*.localhost|*.localhost.|localhost.localdomain|ip6-localhost|ip6-loopback|127.*|0|0.0.0.0|"[::1]"|"[::]"|"[0:0:0:0:0:0:0:1]"|"[0:0:0:0:0:0:0:0]"|"[::ffff:127."*|"[::ffff:7f"*)
         echo "!! loki_url points at ${loki_host}, which inside this add-on is the add-on itself - nothing listens there."
         echo "   Use the address of the machine Grafana Loki runs on (its IP or hostname on your network)."
         exit 1 ;;
@@ -246,7 +263,8 @@ HOST_LABEL_S=$(alloy_str "${HOST_LABEL}")
 
 echo "-----------------------------------------------------------"
 echo " Grafana Alloy for Home Assistant (${VARIANT})"
-echo " Loki URL: ${LOKI_URL}   auth: ${loki_auth_kind}$([ -n "${LOKI_TENANT_ID}" ] && echo "   tenant: ${LOKI_TENANT_ID}")"
+echo " Loki URL: $(redact "${LOKI_URL}")   auth: ${loki_auth_kind}$([ -n "${LOKI_TENANT_ID}" ] && echo "   tenant: ${LOKI_TENANT_ID}")"
+cleartext_creds "${LOKI_URL}" "${loki_auth_kind}"
 echo " Loki push retried: ${loki_retries_desc}"
 echo " Journal path: ${JOURNAL_PATH}"
 echo " Log level: ${LOG_LEVEL}"
@@ -520,7 +538,8 @@ if [ "${METRICS_ENABLED}" = "true" ] || [ "${SELF_METRICS}" = "true" ] || [ "${H
     else
         rm -f "${RW_PASSWORD_FILE}"
     fi
-    echo " remote_write: ${METRICS_REMOTE_WRITE_URL} (auth: $([ -n "${rw_auth}" ] && echo basic || echo none))"
+    echo " remote_write: $(redact "${METRICS_REMOTE_WRITE_URL}") (auth: $([ -n "${rw_auth}" ] && echo basic || echo none))"
+    cleartext_creds "${METRICS_REMOTE_WRITE_URL}" "$([ -n "${rw_auth}" ] && echo basic || echo none)"
     cat >> "${CONFIG_FILE}" <<EOF
 
 // --- metrics go here ---
@@ -562,7 +581,7 @@ if [ "${METRICS_ENABLED}" = "true" ]; then
     else
         rm -f "${TOKEN_FILE}"
     fi
-    echo " metrics: ${scheme}://${hostport}${path} every ${METRICS_INTERVAL} as job ${METRICS_JOB} (token: $([ -n "${auth}" ] && echo set || echo none))"
+    echo " metrics: $(redact "${scheme}://${hostport}${path}") every ${METRICS_INTERVAL} as job ${METRICS_JOB} (token: $([ -n "${auth}" ] && echo set || echo none))"
     cat >> "${CONFIG_FILE}" <<EOF
 
 // --- Home Assistant metrics (metrics_enabled) ---

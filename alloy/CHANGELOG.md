@@ -16,6 +16,24 @@ goes directly under the marker below, which Renovate needs to find its
 heading.
 
 <!-- renovate:alloy-release -->
+## 1.22.0.3
+
+- Grafana Alloy's profiling endpoints (`/debug/pprof`) are off. The
+  HTTP server has no authentication and is reachable from Home
+  Assistant Core and every other app; the debug UI stays.
+- The add-on log masks a `user:password@` in a URL, and warns when
+  credentials go to an `http://` URL.
+- The `loki_url` localhost check also refuses `*.localhost`,
+  `localhost.localdomain`, `0`, the long IPv6 loopback forms and
+  IPv4-mapped loopback.
+- AppArmor: Grafana Alloy may read its storage directory and the four
+  credential files in `/data`, no longer all of it (`options.json`
+  holds every secret). The s6 template rules no longer allow writing
+  into the directories they execute from; the unused bashio rule is
+  gone.
+- `unzip` is removed from the image after the Grafana Alloy archive is
+  unpacked.
+
 ## 1.22.0.2
 
 - New option `loki_max_retries`, default `0`: a failed push is retried

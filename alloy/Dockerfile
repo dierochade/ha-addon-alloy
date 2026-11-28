@@ -30,7 +30,10 @@ RUN apt-get update \
 
 # TARGETARCH comes from BuildKit (amd64 | arm64). The release archive is
 # verified against Grafana's published SHA256SUMS before it is unpacked; a
-# checksum mismatch or a missing entry fails the build.
+# checksum mismatch or a missing entry fails the build. (Integrity, not
+# authenticity: Grafana publishes no signature for the archive.) unzip is
+# removed again afterwards; curl stays for the HEALTHCHECK, jq and bash for
+# the config generator.
 ARG TARGETARCH
 RUN set -eux; \
     if [ -z "${TARGETARCH}" ]; then \
@@ -51,6 +54,7 @@ RUN set -eux; \
     unzip -q "${asset}.zip" -d extract; \
     install -m 0755 "extract/${asset}" /usr/bin/alloy; \
     rm -rf "${asset}.zip" SHA256SUMS "${asset}.sha256" extract; \
+    apt-get purge -y unzip; \
     /usr/bin/alloy --version
 
 COPY rootfs /

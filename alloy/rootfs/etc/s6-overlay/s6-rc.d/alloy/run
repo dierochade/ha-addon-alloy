@@ -1,8 +1,13 @@
 #!/usr/bin/with-contenv bash
 # --disable-reporting: no anonymous usage reports to Grafana from a household.
 # It is also what made Alloy 1.19 read the machine's DMI product UUID.
+# --server.http.enable-pprof=false: the HTTP server has no authentication and
+# listens on the app network (Home Assistant Core and every other app), so no
+# profiling endpoints there. The debug UI and /-/ready stay. 0.0.0.0 and not
+# loopback: a host port mapped for debugging reaches the container's address.
 exec /usr/bin/alloy run \
     --server.http.listen-addr=0.0.0.0:12345 \
+    --server.http.enable-pprof=false \
     --storage.path=/data/alloy \
     --disable-reporting \
     /etc/alloy/config.alloy

@@ -19,7 +19,8 @@
 #   7. basic auth, a bearer token and a tenant reach a Loki that checks them
 #   8. a localhost loki_url, contradictory credentials and an invalid
 #      multiline_containers regex are refused with a reason; a job with
-#      quotes and backslashes ships as that exact label
+#      quotes and backslashes ships as that exact label; a password in the
+#      URL is masked in the log
 #   9. host_label: the line carries a static host label and no hostname
 #  10. strip_ansi: colour codes are gone from the stored line, and the level
 #      token behind one is still found
@@ -319,6 +320,8 @@ want=$(sed -n 's/^version: "\(.*\)"$/\1/p' "$VERSION_SRC" | cut -d. -f1-3)
 have=$(docker run --rm --entrypoint /usr/bin/alloy "$IMAGE" --version | sed -n 's/^alloy, version v\([^ ]*\).*/\1/p')
 echo "config.yaml alloy version=$want  image alloy=$have"
 [ -n "$want" ] && [ "$want" = "$have" ] || fail "version mismatch: the published tag would lie about what is inside"
+# unzip only unpacks Alloy at build time; it must not stay in the image.
+docker run --rm --entrypoint /bin/sh "$IMAGE" -c 'command -v unzip' >/dev/null && fail "unzip is still in the image"
 if [ "$SLUG" != "alloy" ]; then
   # The variant's own version is the base tag it is built on, optionally with
   # a further component for a host-only revision. Renovate writes the plain
@@ -352,6 +355,11 @@ if [ -z "$LOCAL" ]; then
   [ -z "$(our_meta)" ] || fail "structured metadata present although the option defaults off: $STREAM"
   echo "default label set exact; no structured metadata from the add-on"
 fi
+# The HTTP server has no authentication: no profiling endpoints on it. With
+# pprof on, /debug/pprof/cmdline answers with Alloy's command line.
+pprof=$(docker exec "$NAME" sh -c 'curl -s http://127.0.0.1:12345/debug/pprof/cmdline | tr "\0" " "')
+case "$pprof" in *storage.path*) fail "/debug/pprof is served" ;; esac
+echo "no /debug/pprof"
 
 say "3. Opinionated options: custom job, extra labels, metadata, level_from_message"
 start_addon "{\"loki_url\":\"$LOKI_PUSH\",\"log_level\":\"info\",\"job\":\"e2e-custom\",\"stream_labels\":[\"hostname\",\"unit\",\"level\",\"syslog_identifier\"],\"structured_metadata\":true,\"level_from_message\":true}"
@@ -506,6 +514,7 @@ if [ -z "$LOCAL" ]; then
   [ "$plen" = "${#LOKI_PASS}" ] || fail "password file is $plen bytes, password is ${#LOKI_PASS}"
   [ "$(docker exec "$NAME" stat -c '%a' /data/loki.password)" = "600" ] || fail "password file is not 0600"
   docker exec "$NAME" grep -qF "$LOKI_PASS" /etc/alloy/config.alloy && fail "the password is in the generated config"
+  case "$(docker logs "$NAME" 2>&1)" in *"cross the network unencrypted"*) : ;; *) fail "no warning for basic auth over http://" ;; esac
   probe e2e-basic "ci-probe-basic-$RUN_ID-$RANDOM"
   grep -q 'forwarded 0' /tmp/proxy.log || { cat /tmp/proxy.log; fail "the line arrived, but not through basic auth"; }
   echo "basic auth + tenant: accepted by the proxy, line in Loki"
@@ -521,6 +530,14 @@ fi
 
 say "8. Options that must be refused, and values that must be escaped"
 expect_refusal "{\"loki_url\":\"http://localhost:3100/loki/api/v1/push\"}" "is the add-on itself"
+expect_refusal "{\"loki_url\":\"http://loki.localhost:3100/loki/api/v1/push\"}" "is the add-on itself"
+expect_refusal "{\"loki_url\":\"http://[0:0:0:0:0:0:0:1]:3100/loki/api/v1/push\"}" "is the add-on itself"
+# A password in the URL never reaches the log (which is shipped to Loki).
+SECRET="e2e-secret-$RUN_ID-$RANDOM"
+start_addon "{\"loki_url\":\"${LOKI_PUSH/:\/\//://e2e:$SECRET@}\",\"job\":\"e2e-userinfo\"}"
+case "$(docker logs "$NAME" 2>&1)" in *"$SECRET"*) fail "the password in loki_url is in the add-on log" ;; esac
+case "$(docker logs "$NAME" 2>&1)" in *"://***@"*) : ;; *) fail "the URL in the log is not masked" ;; esac
+echo "password in the URL masked in the log"
 expect_refusal "{\"loki_url\":\"$LOKI_PUSH\",\"loki_username\":\"u\",\"loki_bearer_token\":\"t\"}" "one or the other"
 # Regexes `alloy validate` would pass and Alloy would then fail to build.
 expect_refusal "{\"loki_url\":\"$LOKI_PUSH\",\"multiline_containers\":\"x|y)\"}" "not a valid regex"

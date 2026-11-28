@@ -11,7 +11,7 @@ The defaults ship the journal **as journald recorded it**: job `systemd-journal`
 | Option | Default | What it does |
 |---|---|---|
 | `loki_url` | *(required)* | Grafana Loki push endpoint, e.g. `http://192.168.1.45:3100/loki/api/v1/push`. The address of the machine Grafana Loki runs on: `localhost` is the add-on itself, so the add-on refuses it |
-| `loki_username` / `loki_password` | *(empty)* | Basic auth for the push, as Grafana Cloud and most reverse proxies require. The password is kept in a 0600 file, never in the generated config |
+| `loki_username` / `loki_password` | *(empty)* | Basic auth for the push, as Grafana Cloud and most reverse proxies require. The password is kept in a 0600 file, never in the generated config. Over an `http://` URL the add-on warns: the credentials are then readable on the network |
 | `loki_bearer_token` | *(empty)* | Sent as `Authorization: Bearer …` instead, for a token-checking proxy. Set this **or** a username, not both - the add-on refuses both |
 | `loki_tenant_id` | *(empty)* | Sent as `X-Scope-OrgID`, for a multi-tenant Grafana Loki. Not needed for Grafana Cloud or a single-tenant Loki |
 | `loki_max_retries` | `0` | How often a failed push is retried before its batch is dropped. `0` = until it succeeds (Grafana Alloy's own default is 10, about 8.5 to 13.5 minutes). The journal keeps every line until it is read, so while a push retries Grafana Alloy stops reading, and a Grafana Loki outage only delays the lines. See **Health and restarts** |
@@ -55,7 +55,7 @@ Off by default. When on, the add-on scrapes one OpenMetrics endpoint - by defaul
 
 ## Debug UI
 
-Grafana Alloy's debug UI (component health, pipeline graph) listens on port 12345 inside the add-on but is **not published on the host by default**, because it has no authentication. To use it temporarily, set a host port for `12345/tcp` in the add-on's Network settings, and clear it again afterwards. The health check does not need the mapping: Docker runs it inside the add-on.
+Grafana Alloy's debug UI (component health, pipeline graph) listens on port 12345 inside the add-on but is **not published on the host by default**, because it has no authentication. Its profiling endpoints (`/debug/pprof`) are switched off. To use it temporarily, set a host port for `12345/tcp` in the add-on's Network settings, and clear it again afterwards. The health check does not need the mapping: Docker runs it inside the add-on.
 
 ## Health and restarts
 

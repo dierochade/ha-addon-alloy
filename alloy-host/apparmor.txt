@@ -47,14 +47,16 @@ profile alloy-host flags=(attach_disconnected,mediate_deleted) {
   /package/** ix,
   /command/** ix,
   /etc/s6-overlay/** rix,
-  /etc/services.d/** rwix,
-  /etc/cont-init.d/** rwix,
-  /etc/cont-finish.d/** rwix,
+  # s6-overlay's legacy stages list and run these; nothing writes there
+  # (the template's rwix allowed writing a file and then executing it).
+  /etc/services.d/** rix,
+  /etc/cont-init.d/** rix,
+  /etc/cont-finish.d/** rix,
   /run/{,**} rwk,
   /dev/tty rw,
 
-  # Bashio
-  /usr/lib/bashio/** ix,
+  # Scratch space for the scripts. (The template's bashio rule is gone:
+  # nothing here runs bashio.)
   /tmp/** rwk,
 
   # The HEALTHCHECK runs curl under this profile against the local Alloy port
@@ -99,8 +101,15 @@ profile alloy-host flags=(attach_disconnected,mediate_deleted) {
     # Generated config, read only
     /etc/alloy/config.alloy r,
 
-    # Storage path (WAL, positions)
-    /data/** rwk,
+    # Storage path (positions, WAL) and the credential files init-alloy
+    # writes - not /data/**: options.json holds every secret of the add-on,
+    # and Alloy itself needs none of it.
+    /data/alloy/ rw,
+    /data/alloy/** rwk,
+    /data/loki.password r,
+    /data/loki.token r,
+    /data/metrics.token r,
+    /data/remote_write.password r,
 
     # The host journal, mapped read-only by journald: true
     /var/log/journal/ r,
