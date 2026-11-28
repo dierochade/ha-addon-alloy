@@ -57,7 +57,28 @@ configuration:
       Docker logs a container's stderr at priority "err", so an add-on's own
       WARN or INFO lines arrive as level=error. When on, container lines at
       that priority get their level from the message text (level=... or a
-      bare WARN/INFO/... token). Off keeps the journal's own priority.
+      bare WARN/INFO/... token, or a lowercase level as the line's first word such as "info: ..."). Off keeps the journal's own priority.
+  strip_ansi:
+    name: Strip ANSI colour codes
+    description: >-
+      Removes terminal colour codes (ESC [ ... m) from every line. Home
+      Assistant, the Supervisor and Zigbee2MQTT colour their logs; in Grafana
+      the codes show up as garbage and break text searches. Off keeps the
+      lines as the journal recorded them.
+  multiline_containers:
+    name: Join tracebacks (containers)
+    description: >-
+      Regex of container names whose Python tracebacks become one entry
+      instead of one per line, e.g. homeassistant|hassio_supervisor. A line
+      that does not start with a timestamp is appended to the record before
+      it (up to 3 s, 128 lines). Empty = off.
+  host_label:
+    name: Host label
+    description: >-
+      Gives every line a static host label with this value, e.g. haos or
+      homeassistant-vm, in place of the hostname label - for a Grafana Loki
+      whose other sources already name machines with host. Empty keeps
+      hostname (if chosen in stream labels).
   metrics_enabled:
     name: Scrape metrics
     description: >-
