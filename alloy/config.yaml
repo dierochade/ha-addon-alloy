@@ -11,7 +11,7 @@ name: Alloy
 # every change to the image, the profile or the options needs a new revision
 # (the gate says which), and on a Renovate base image bump the revision bot
 # (.github/workflows/revision.yaml) writes it.
-version: "1.21.3"
+version: "1.22.0.1"
 slug: alloy
 description: >-
   Ship the Home Assistant OS systemd journal to Loki with Grafana Alloy.
@@ -51,6 +51,7 @@ options:
     - level
   structured_metadata: false
   level_from_message: false
+  strip_ansi: false
   # Every optional key is listed here with an empty value ON PURPOSE: the
   # configuration form shows an optional field only if the key is present in
   # options (frontend: supervisor-app-config.ts, `entry.name in options ||
@@ -62,6 +63,8 @@ options:
   loki_password: ""
   loki_bearer_token: ""
   loki_tenant_id: ""
+  host_label: ""
+  multiline_containers: ""
   metrics_enabled: false
   metrics_url: ""
   metrics_token: ""
@@ -81,6 +84,13 @@ schema:
     - "list(hostname|unit|level|syslog_identifier|container_name|transport|priority)"
   structured_metadata: bool
   level_from_message: bool
+  strip_ansi: bool
+  # A static `host` stream label in place of `hostname`, for a Loki whose other
+  # sources name the machine that way. Empty = hostname as chosen above.
+  host_label: "str?"
+  # A regex of container names (e.g. homeassistant|hassio_supervisor) whose
+  # Python tracebacks are joined into one entry. Empty = off.
+  multiline_containers: "str?"
   # Loki authentication: basic auth OR a bearer token (the generator refuses
   # both), and the X-Scope-OrgID tenant for a multi-tenant Loki.
   loki_username: "str?"

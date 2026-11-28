@@ -16,7 +16,7 @@ FROM ghcr.io/home-assistant/base-debian:trixie-2026.08.0@sha256:01e153da2c2579f2
 
 # Renovate tracks this against grafana/alloy releases and bumps config.yaml's
 # version in the same PR: the add-on version IS the Alloy version.
-ARG ALLOY_VERSION="1.21.3"
+ARG ALLOY_VERSION="1.22.0"
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -55,9 +55,13 @@ RUN set -eux; \
 
 COPY rootfs /
 
-# The Supervisor reads container health from this; the `watchdog` key in
-# config.yaml is obsolete. /-/ready is served on the container's own address,
-# so it works with the debug port unmapped on the host.
+# Docker runs this inside the container, so it works with the debug port
+# unmapped on the host. When the app's Watchdog is on (it is off by default),
+# the Supervisor restarts a container this reports unhealthy. A `watchdog:`
+# URL in config.yaml would be a second probe of the same endpoint, polled by
+# the Supervisor over the app network, so there is none. /-/ready and not
+# /-/healthy: Grafana advises against restarting on component health, which
+# a remote endpoint being down already fails.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -fsS -o /dev/null http://127.0.0.1:12345/-/ready || exit 1
 

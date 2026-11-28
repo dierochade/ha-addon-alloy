@@ -16,6 +16,70 @@ goes directly under the marker below, which Renovate needs to find its
 heading.
 
 <!-- renovate:alloy-release -->
+## 1.22.0.1
+
+- `level_from_message` reads the level from the head of the line (its
+  first 80 characters) and takes the leftmost one there. A line that
+  starts with `ERROR` stays an error even if `level=debug` or `INFO`
+  appears later in it. New forms: logfmt in any case (`level=INFO`, as
+  Go's slog writes it) and a lowercase level in brackets after a
+  timestamp (`[warn]`, as nginx writes it). A logfmt `level=` beyond the
+  head is the fallback.
+- `multiline_containers` is compiled before Grafana Alloy starts: an
+  invalid regex (`x|y)`, a stacked quantifier) stops the add-on with the
+  reason instead of failing inside Grafana Alloy at start.
+- `host_metrics: false` (alloy-host) turns host metrics off. It was read
+  as on: jq's `//` treats `false` like a missing value.
+- Docs: a "Health and restarts" section (Home Assistant restarts an
+  unhealthy add-on only with Watchdog on, which is off by default), a
+  silence alert that fires (`absent_over_time`), and the journal history
+  read on first start (7 h, not all of it). Comments that called the
+  `watchdog:` key obsolete are corrected.
+
+## 1.22.0
+
+Grafana Alloy 1.22.0; the add-on itself is unchanged.
+Upstream release notes: https://github.com/grafana/alloy/releases/tag/v1.22.0
+
+## 1.21.3.5
+
+- New option `multiline_containers`: a regex of container names whose
+  Python tracebacks are joined into one entry instead of one per line
+  (Home Assistant: `homeassistant|hassio_supervisor`). Empty by default.
+- On the JSON path (`structured_metadata`) the line becomes the journal
+  MESSAGE right after the fields are extracted, not at the end of the
+  pipeline. Every stage that reads text now reads the plain MESSAGE on
+  both paths. What is shipped does not change.
+
+## 1.21.3.4
+
+- `level_from_message` also reads a lowercase level when it is the line's
+  first word, optionally behind one `program: ` prefix: `info: ...`,
+  `s6-rc: info: ...`, `[warn] ...`. Every s6-overlay and bashio start-up
+  line arrived as `level="error"` before. A lowercase word anywhere else
+  ("disk info: low") is still not a level.
+
+## 1.21.3.3
+
+- New option `strip_ansi`: removes terminal colour codes from every line
+  before anything else reads it. Home Assistant, the Supervisor and
+  Zigbee2MQTT colour their output. Off by default.
+
+## 1.21.3.2
+
+- New option `host_label`: a static `host` stream label in place of
+  `hostname`, for a Grafana Loki whose other sources already name the machine
+  with `host` (ecohash-co/ha-addon-alloy#13 asked for the same). Empty by
+  default, so nothing changes for an existing install.
+
+## 1.21.3.1
+
+- AppArmor: accept stop signals from `runc`. On hosts where runc has an
+  AppArmor profile of its own (AppArmor 4, such as the Ubuntu 24.04 CI
+  runner) Docker's SIGTERM/SIGKILL were denied, which failed the e2e gate for
+  every pull request since 2026-11-13. AppArmor 3.1.7, which Home Assistant
+  OS ships, has no runc profile, so nothing changes there.
+
 ## 1.21.3
 
 Grafana Alloy 1.21.3; the add-on itself is unchanged.
